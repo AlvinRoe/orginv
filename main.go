@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -771,7 +772,7 @@ func fetchDependabotAlerts(ctx context.Context, client *github.Client, org strin
 		opts := &github.ListAlertsOptions{ListOptions: github.ListOptions{PerPage: perPage, Page: page}}
 		alerts, resp, err := client.Dependabot.ListOrgAlerts(ctx, org, opts)
 		if err != nil {
-			return nil, pageCount, err
+			return nil, pageCount, fmt.Errorf("dependabot org alerts fetch failed (org=%s page=%d): %s", org, page, formatGitHubAPIError(err))
 		}
 		pageCount++
 		all = append(all, alerts...)
@@ -867,7 +868,7 @@ func fetchCodeScanningAlerts(ctx context.Context, client *github.Client, org str
 		opts := &github.AlertListOptions{ListOptions: github.ListOptions{PerPage: perPage, Page: page}}
 		alerts, resp, err := client.CodeScanning.ListAlertsForOrg(ctx, org, opts)
 		if err != nil {
-			return nil, pageCount, err
+			return nil, pageCount, fmt.Errorf("code scanning org alerts fetch failed (org=%s page=%d): %s", org, page, formatGitHubAPIError(err))
 		}
 		pageCount++
 		all = append(all, alerts...)
@@ -963,7 +964,7 @@ func fetchSecretScanningAlerts(ctx context.Context, client *github.Client, org s
 		opts := &github.SecretScanningAlertListOptions{ListOptions: github.ListOptions{PerPage: perPage, Page: page}}
 		alerts, resp, err := client.SecretScanning.ListAlertsForOrg(ctx, org, opts)
 		if err != nil {
-			return nil, pageCount, err
+			return nil, pageCount, fmt.Errorf("secret scanning org alerts fetch failed (org=%s page=%d): %s", org, page, formatGitHubAPIError(err))
 		}
 		pageCount++
 		all = append(all, alerts...)
@@ -1149,19 +1150,152 @@ func ingestWorkflowRuns(db *sql.DB, runUUID string, repoID int64, runs []*github
 func exportCSVReport(db *sql.DB, runUUID, outputPath string) error {
 	query := `
 		SELECT
+			r.run_uuid,
+			r.repo_id,
+			r.org_login,
+			r.name,
 			r.full_name,
+			r.visibility,
+			r.private,
+			r.archived,
+			r.disabled,
+			r.default_branch,
+			r.language,
+			r.open_issues_count,
+			r.created_at AS repo_created_at,
+			r.updated_at AS repo_updated_at,
+			r.pushed_at AS repo_pushed_at,
+			r.metadata_json AS repo_metadata_json,
+			(SELECT sd.spdx_version FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_spdx_version,
+			(SELECT sd.generated_at FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_generated_at,
+			(SELECT sd.raw_json FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_raw_json,
 			(SELECT COUNT(1) FROM repo_dependencies rd WHERE rd.run_uuid = ? AND rd.repo_id = r.repo_id) AS dependency_count,
+			(
+				SELECT COALESCE(group_concat(
+					'dependency_id=' || d.dependency_id ||
+					';ecosystem=' || COALESCE(d.ecosystem, '') ||
+					';name=' || COALESCE(d.name, '') ||
+					';version=' || COALESCE(d.version, '') ||
+					';purl=' || COALESCE(d.purl, '') ||
+					';license=' || COALESCE(d.license, '') ||
+					';supplier=' || COALESCE(d.supplier, ''),
+					char(10)
+				), '')
+				FROM repo_dependencies rd
+				JOIN dependencies d ON d.dependency_id = rd.dependency_id
+				WHERE rd.run_uuid = ? AND rd.repo_id = r.repo_id
+			) AS dependency_details,
 			(SELECT COUNT(1) FROM dependabot_alerts da WHERE da.run_uuid = ? AND da.repo_id = r.repo_id AND lower(da.state) = 'open') AS open_dependabot_alerts,
 			(SELECT COUNT(1) FROM dependabot_alerts da WHERE da.run_uuid = ? AND da.repo_id = r.repo_id AND lower(da.state) = 'open' AND lower(da.severity) = 'critical') AS open_critical_dependabot_alerts,
+			(SELECT COUNT(1) FROM dependabot_alerts da WHERE da.run_uuid = ? AND da.repo_id = r.repo_id) AS total_dependabot_alerts,
+			(
+				SELECT COALESCE(group_concat(
+					'alert_number=' || da.alert_number ||
+					';state=' || COALESCE(da.state, '') ||
+					';severity=' || COALESCE(da.severity, '') ||
+					';ecosystem=' || COALESCE(da.ecosystem, '') ||
+					';package_name=' || COALESCE(da.package_name, '') ||
+					';manifest_path=' || COALESCE(da.manifest_path, '') ||
+					';created_at=' || COALESCE(da.created_at, '') ||
+					';updated_at=' || COALESCE(da.updated_at, '') ||
+					';fixed_at=' || COALESCE(da.fixed_at, '') ||
+					';dismissed_reason=' || COALESCE(da.dismissed_reason, '') ||
+					';dependency_id=' || COALESCE(CAST(da.dependency_id AS TEXT), ''),
+					char(10)
+				), '')
+				FROM dependabot_alerts da
+				WHERE da.run_uuid = ? AND da.repo_id = r.repo_id
+			) AS dependabot_alert_details,
 			(SELECT COUNT(1) FROM code_scanning_alerts ca WHERE ca.run_uuid = ? AND ca.repo_id = r.repo_id AND lower(ca.state) = 'open') AS open_code_scanning_alerts,
+			(SELECT COUNT(1) FROM code_scanning_alerts ca WHERE ca.run_uuid = ? AND ca.repo_id = r.repo_id) AS total_code_scanning_alerts,
+			(
+				SELECT COALESCE(group_concat(
+					'alert_number=' || ca.alert_number ||
+					';state=' || COALESCE(ca.state, '') ||
+					';rule_id=' || COALESCE(ca.rule_id, '') ||
+					';tool=' || COALESCE(ca.tool, '') ||
+					';severity=' || COALESCE(ca.severity, '') ||
+					';security_severity=' || COALESCE(ca.security_severity, '') ||
+					';created_at=' || COALESCE(ca.created_at, '') ||
+					';fixed_at=' || COALESCE(ca.fixed_at, '') ||
+					';most_recent_instance_json=' || COALESCE(ca.most_recent_instance_json, ''),
+					char(10)
+				), '')
+				FROM code_scanning_alerts ca
+				WHERE ca.run_uuid = ? AND ca.repo_id = r.repo_id
+			) AS code_scanning_alert_details,
 			(SELECT COUNT(1) FROM secret_scanning_alerts sa WHERE sa.run_uuid = ? AND sa.repo_id = r.repo_id AND lower(sa.state) = 'open') AS open_secret_scanning_alerts,
-			(SELECT COUNT(1) FROM workflow_runs wr WHERE wr.run_uuid = ? AND wr.repo_id = r.repo_id AND lower(COALESCE(wr.conclusion, '')) = 'failure') AS failed_workflow_runs
+			(SELECT COUNT(1) FROM secret_scanning_alerts sa WHERE sa.run_uuid = ? AND sa.repo_id = r.repo_id) AS total_secret_scanning_alerts,
+			(
+				SELECT COALESCE(group_concat(
+					'alert_number=' || sa.alert_number ||
+					';state=' || COALESCE(sa.state, '') ||
+					';secret_type=' || COALESCE(sa.secret_type, '') ||
+					';resolution=' || COALESCE(sa.resolution, '') ||
+					';created_at=' || COALESCE(sa.created_at, '') ||
+					';updated_at=' || COALESCE(sa.updated_at, '') ||
+					';resolved_at=' || COALESCE(sa.resolved_at, ''),
+					char(10)
+				), '')
+				FROM secret_scanning_alerts sa
+				WHERE sa.run_uuid = ? AND sa.repo_id = r.repo_id
+			) AS secret_scanning_alert_details,
+			(SELECT COUNT(1) FROM repo_rulesets rr WHERE rr.run_uuid = ? AND rr.repo_id = r.repo_id) AS total_rulesets,
+			(
+				SELECT COALESCE(group_concat(
+					'ruleset_id=' || rr.ruleset_id ||
+					';enforcement=' || COALESCE(rr.enforcement, '') ||
+					';target=' || COALESCE(rr.target, '') ||
+					';raw_json=' || COALESCE(rr.raw_json, ''),
+					char(10)
+				), '')
+				FROM repo_rulesets rr
+				WHERE rr.run_uuid = ? AND rr.repo_id = r.repo_id
+			) AS ruleset_details,
+			(SELECT COUNT(1) FROM workflow_runs wr WHERE wr.run_uuid = ? AND wr.repo_id = r.repo_id AND lower(COALESCE(wr.conclusion, '')) = 'failure') AS failed_workflow_runs,
+			(SELECT COUNT(1) FROM workflow_runs wr WHERE wr.run_uuid = ? AND wr.repo_id = r.repo_id) AS total_workflow_runs,
+			(
+				SELECT COALESCE(group_concat(
+					'run_id=' || wr.run_id ||
+					';workflow_name=' || COALESCE(wr.workflow_name, '') ||
+					';status=' || COALESCE(wr.status, '') ||
+					';conclusion=' || COALESCE(wr.conclusion, '') ||
+					';run_started_at=' || COALESCE(wr.run_started_at, '') ||
+					';updated_at=' || COALESCE(wr.updated_at, ''),
+					char(10)
+				), '')
+				FROM workflow_runs wr
+				WHERE wr.run_uuid = ? AND wr.repo_id = r.repo_id
+			) AS workflow_run_details
 		FROM repos r
 		WHERE r.run_uuid = ?
 		ORDER BY open_critical_dependabot_alerts DESC, open_dependabot_alerts DESC, r.full_name ASC
 	`
 
-	rows, err := db.Query(query, runUUID, runUUID, runUUID, runUUID, runUUID, runUUID, runUUID)
+	rows, err := db.Query(
+		query,
+		runUUID, // sbom_spdx_version
+		runUUID, // sbom_generated_at
+		runUUID, // sbom_raw_json
+		runUUID, // dependency_count
+		runUUID, // dependency_details
+		runUUID, // open_dependabot_alerts
+		runUUID, // open_critical_dependabot_alerts
+		runUUID, // total_dependabot_alerts
+		runUUID, // dependabot_alert_details
+		runUUID, // open_code_scanning_alerts
+		runUUID, // total_code_scanning_alerts
+		runUUID, // code_scanning_alert_details
+		runUUID, // open_secret_scanning_alerts
+		runUUID, // total_secret_scanning_alerts
+		runUUID, // secret_scanning_alert_details
+		runUUID, // total_rulesets
+		runUUID, // ruleset_details
+		runUUID, // failed_workflow_runs
+		runUUID, // total_workflow_runs
+		runUUID, // workflow_run_details
+		runUUID, // repos filter
+	)
 	if err != nil {
 		return err
 	}
@@ -1352,4 +1486,26 @@ func stringifyDBValue(v interface{}) string {
 	default:
 		return fmt.Sprintf("%v", x)
 	}
+}
+
+func formatGitHubAPIError(err error) string {
+	var ghErr *github.ErrorResponse
+	if !errors.As(err, &ghErr) {
+		return err.Error()
+	}
+	statusCode := 0
+	status := ""
+	url := ""
+	scopes := ""
+	acceptedScopes := ""
+	if ghErr.Response != nil {
+		statusCode = ghErr.Response.StatusCode
+		status = ghErr.Response.Status
+		scopes = ghErr.Response.Header.Get("X-OAuth-Scopes")
+		acceptedScopes = ghErr.Response.Header.Get("X-Accepted-OAuth-Scopes")
+		if ghErr.Response.Request != nil && ghErr.Response.Request.URL != nil {
+			url = ghErr.Response.Request.URL.String()
+		}
+	}
+	return fmt.Sprintf("status=%d (%s) url=%s message=%q oauth_scopes=%q accepted_scopes=%q", statusCode, status, url, ghErr.Message, scopes, acceptedScopes)
 }
