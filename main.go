@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,46 @@ type retryRoundTripper struct {
 	transport  http.RoundTripper
 	maxRetries int
 	baseDelay  time.Duration
+}
+
+type config struct {
+	Org            string
+	Token          string
+	ResultsPerPage int
+	SQLitePath     string
+	CSVOutputPath  string
+}
+
+type dbWriteOp struct {
+	name     string
+	priority int
+	rows     int
+	apply    func(*sql.DB) error
+}
+
+type spdxDocument struct {
+	SPDXVersion  string `json:"spdxVersion"`
+	CreationInfo struct {
+		Created string `json:"created"`
+	} `json:"creationInfo"`
+	Packages      []spdxPackage `json:"packages"`
+	Relationships []struct {
+		SpdxElementID      string `json:"spdxElementId"`
+		RelationshipType   string `json:"relationshipType"`
+		RelatedSpdxElement string `json:"relatedSpdxElement"`
+	} `json:"relationships"`
+}
+
+type spdxPackage struct {
+	SPDXID           string      `json:"SPDXID"`
+	Name             string      `json:"name"`
+	VersionInfo      string      `json:"versionInfo"`
+	LicenseConcluded string      `json:"licenseConcluded"`
+	Supplier         interface{} `json:"supplier"`
+	ExternalRefs     []struct {
+		ReferenceType    string `json:"referenceType"`
+		ReferenceLocator string `json:"referenceLocator"`
+	} `json:"externalRefs"`
 }
 
 func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -58,110 +99,6 @@ func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	}
 
 	return resp, err
-}
-
-type config struct {
-	Org            string
-	Token          string
-	ResultsPerPage int
-	SQLitePath     string
-	CSVOutputPath  string
-}
-
-type dependabotAlert struct {
-	Number                int64     `json:"number"`
-	State                 string    `json:"state"`
-	CreatedAt             time.Time `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
-	FixedAt               time.Time `json:"fixed_at"`
-	Dismissed             string    `json:"dismissed_reason"`
-	SecurityVulnerability struct {
-		Severity string `json:"severity"`
-		Package  struct {
-			Name      string `json:"name"`
-			Ecosystem string `json:"ecosystem"`
-		} `json:"package"`
-	} `json:"security_vulnerability"`
-	Dependency struct {
-		Package struct {
-			Name      string `json:"name"`
-			Ecosystem string `json:"ecosystem"`
-		} `json:"package"`
-		ManifestPath string `json:"manifest_path"`
-	} `json:"dependency"`
-	Repository struct {
-		ID       int64  `json:"id"`
-		Name     string `json:"name"`
-		FullName string `json:"full_name"`
-	} `json:"repository"`
-}
-
-type codeScanningAlert struct {
-	Number                int64     `json:"number"`
-	State                 string    `json:"state"`
-	CreatedAt             time.Time `json:"created_at"`
-	FixedAt               time.Time `json:"fixed_at"`
-	Severity              string    `json:"severity"`
-	SecuritySeverityLevel string    `json:"security_severity_level"`
-	Rule                  struct {
-		ID string `json:"id"`
-	} `json:"rule"`
-	Tool struct {
-		Name string `json:"name"`
-	} `json:"tool"`
-	MostRecentInstance json.RawMessage `json:"most_recent_instance"`
-	Repository         struct {
-		ID       int64  `json:"id"`
-		Name     string `json:"name"`
-		FullName string `json:"full_name"`
-	} `json:"repository"`
-}
-
-type secretScanningAlert struct {
-	Number     int64     `json:"number"`
-	State      string    `json:"state"`
-	SecretType string    `json:"secret_type"`
-	Resolution string    `json:"resolution"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
-	ResolvedAt time.Time `json:"resolved_at"`
-	Repository struct {
-		ID       int64  `json:"id"`
-		Name     string `json:"name"`
-		FullName string `json:"full_name"`
-	} `json:"repository"`
-}
-
-type repoRuleset struct {
-	ID          int64           `json:"id"`
-	Enforcement string          `json:"enforcement"`
-	Target      string          `json:"target"`
-	Raw         json.RawMessage `json:"-"`
-}
-
-type spdxDocument struct {
-	SPDXVersion  string `json:"spdxVersion"`
-	CreationInfo struct {
-		Created string `json:"created"`
-	} `json:"creationInfo"`
-	Packages      []spdxPackage `json:"packages"`
-	Relationships []struct {
-		SpdxElementID      string `json:"spdxElementId"`
-		RelationshipType   string `json:"relationshipType"`
-		RelatedSpdxElement string `json:"relatedSpdxElement"`
-	} `json:"relationships"`
-}
-
-type spdxPackage struct {
-	SPDXID           string      `json:"SPDXID"`
-	Name             string      `json:"name"`
-	VersionInfo      string      `json:"versionInfo"`
-	LicenseConcluded string      `json:"licenseConcluded"`
-	Supplier         interface{} `json:"supplier"`
-	ExternalRefs     []struct {
-		ReferenceType    string `json:"referenceType"`
-		ReferenceLocator string `json:"referenceLocator"`
-	} `json:"externalRefs"`
 }
 
 func main() {
@@ -236,24 +173,98 @@ func main() {
 		errorsSeen = append(errorsSeen, fmt.Sprintf("%s: %v", msg, err))
 		log.Printf("%s: %v", msg, err)
 	}
-
-	log.Printf("ingesting org-level alert datasets")
-	if err := ingestDependabotAlerts(ctx, client, db, runUUID, cfg.Org, cfg.ResultsPerPage, repoIDByName); err != nil {
-		recordErr("dependabot ingestion failed", err)
-	}
-	if err := ingestCodeScanningAlerts(ctx, client, db, runUUID, cfg.Org, cfg.ResultsPerPage, repoIDByName); err != nil {
-		recordErr("code scanning ingestion failed", err)
-	}
-	if err := ingestSecretScanningAlerts(ctx, client, db, runUUID, cfg.Org, cfg.ResultsPerPage, repoIDByName); err != nil {
-		recordErr("secret scanning ingestion failed", err)
+	writeOps := make([]dbWriteOp, 0, len(activeRepos)*3+3)
+	var writeOpsMu sync.Mutex
+	enqueueWriteOp := func(op dbWriteOp) {
+		writeOpsMu.Lock()
+		writeOps = append(writeOps, op)
+		writeOpsMu.Unlock()
 	}
 
-	log.Printf("ingesting per-repo datasets (sbom, rulesets, workflow runs)")
+	log.Printf("fetching org-level alert datasets")
+	var orgWG sync.WaitGroup
+	orgFetch := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "dependabot",
+			run: func() error {
+				alerts, pages, err := fetchDependabotAlerts(ctx, client, cfg.Org, cfg.ResultsPerPage)
+				if err != nil {
+					return err
+				}
+				log.Printf("dependabot fetch complete: pages=%d alerts=%d", pages, len(alerts))
+				enqueueWriteOp(dbWriteOp{
+					name:     "dependabot alerts",
+					priority: 30,
+					rows:     len(alerts),
+					apply: func(execDB *sql.DB) error {
+						return ingestDependabotAlerts(execDB, runUUID, repoIDByName, alerts)
+					},
+				})
+				return nil
+			},
+		},
+		{
+			name: "code scanning",
+			run: func() error {
+				alerts, pages, err := fetchCodeScanningAlerts(ctx, client, cfg.Org, cfg.ResultsPerPage)
+				if err != nil {
+					return err
+				}
+				log.Printf("code scanning fetch complete: pages=%d alerts=%d", pages, len(alerts))
+				enqueueWriteOp(dbWriteOp{
+					name:     "code scanning alerts",
+					priority: 30,
+					rows:     len(alerts),
+					apply: func(execDB *sql.DB) error {
+						return ingestCodeScanningAlerts(execDB, runUUID, repoIDByName, alerts)
+					},
+				})
+				return nil
+			},
+		},
+		{
+			name: "secret scanning",
+			run: func() error {
+				alerts, pages, err := fetchSecretScanningAlerts(ctx, client, cfg.Org, cfg.ResultsPerPage)
+				if err != nil {
+					return err
+				}
+				log.Printf("secret scanning fetch complete: pages=%d alerts=%d", pages, len(alerts))
+				enqueueWriteOp(dbWriteOp{
+					name:     "secret scanning alerts",
+					priority: 30,
+					rows:     len(alerts),
+					apply: func(execDB *sql.DB) error {
+						return ingestSecretScanningAlerts(execDB, runUUID, repoIDByName, alerts)
+					},
+				})
+				return nil
+			},
+		},
+	}
+	for _, task := range orgFetch {
+		orgWG.Add(1)
+		go func(taskName string, run func() error) {
+			defer orgWG.Done()
+			started := time.Now()
+			log.Printf("%s fetch started", taskName)
+			if err := run(); err != nil {
+				recordErr(fmt.Sprintf("%s ingestion failed", taskName), err)
+				return
+			}
+			log.Printf("%s fetch/build done in %s", taskName, time.Since(started))
+		}(task.name, task.run)
+	}
+	orgWG.Wait()
+
+	log.Printf("fetching per-repo datasets (sbom, rulesets, workflow runs)")
 	const repoWorkers = 10
 	repoChan := make(chan *github.Repository, len(activeRepos))
 	var wg sync.WaitGroup
 
-	var dbMu sync.Mutex
 	for i := 0; i < repoWorkers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
@@ -261,39 +272,53 @@ func main() {
 			for repo := range repoChan {
 				repoName := repo.GetName()
 				repoID := repo.GetID()
+				repoStart := time.Now()
+				log.Printf("worker %d fetch started for repo %s", workerID, repoName)
 
 				sbom, _, sbomErr := client.DependencyGraph.GetSBOM(ctx, cfg.Org, repoName)
 				if sbomErr != nil {
 					recordErr(fmt.Sprintf("worker %d sbom %s", workerID, repoName), sbomErr)
 				} else {
-					dbMu.Lock()
-					if err := ingestSBOM(db, runUUID, repoID, sbom); err != nil {
-						recordErr(fmt.Sprintf("worker %d ingest sbom %s", workerID, repoName), err)
-					}
-					dbMu.Unlock()
+					enqueueWriteOp(dbWriteOp{
+						name:     fmt.Sprintf("sbom %s", repoName),
+						priority: 10,
+						rows:     1,
+						apply: func(execDB *sql.DB) error {
+							return ingestSBOM(execDB, runUUID, repoID, sbom)
+						},
+					})
 				}
 
-				rulesets, rErr := fetchRepoRulesets(ctx, client, cfg.Org, repoName, cfg.ResultsPerPage)
+				rulesets, pages, rErr := fetchRepoRulesets(ctx, client, cfg.Org, repoName, cfg.ResultsPerPage)
 				if rErr != nil {
 					recordErr(fmt.Sprintf("worker %d rulesets %s", workerID, repoName), rErr)
 				} else {
-					dbMu.Lock()
-					if err := ingestRepoRulesets(db, runUUID, repoID, rulesets); err != nil {
-						recordErr(fmt.Sprintf("worker %d ingest rulesets %s", workerID, repoName), err)
-					}
-					dbMu.Unlock()
+					log.Printf("worker %d rulesets fetched for %s: pages=%d rulesets=%d", workerID, repoName, pages, len(rulesets))
+					enqueueWriteOp(dbWriteOp{
+						name:     fmt.Sprintf("rulesets %s", repoName),
+						priority: 20,
+						rows:     len(rulesets),
+						apply: func(execDB *sql.DB) error {
+							return ingestRepoRulesets(execDB, runUUID, repoID, rulesets)
+						},
+					})
 				}
 
-				runs, wErr := fetchWorkflowRuns(ctx, client, cfg.Org, repoName, cfg.ResultsPerPage)
+				runs, pages, wErr := fetchWorkflowRuns(ctx, client, cfg.Org, repoName, cfg.ResultsPerPage)
 				if wErr != nil {
 					recordErr(fmt.Sprintf("worker %d workflow runs %s", workerID, repoName), wErr)
 				} else {
-					dbMu.Lock()
-					if err := ingestWorkflowRuns(db, runUUID, repoID, runs); err != nil {
-						recordErr(fmt.Sprintf("worker %d ingest workflow runs %s", workerID, repoName), err)
-					}
-					dbMu.Unlock()
+					log.Printf("worker %d workflow runs fetched for %s: pages=%d runs=%d", workerID, repoName, pages, len(runs))
+					enqueueWriteOp(dbWriteOp{
+						name:     fmt.Sprintf("workflow runs %s", repoName),
+						priority: 20,
+						rows:     len(runs),
+						apply: func(execDB *sql.DB) error {
+							return ingestWorkflowRuns(execDB, runUUID, repoID, runs)
+						},
+					})
 				}
+				log.Printf("worker %d fetch complete for repo %s in %s", workerID, repoName, time.Since(repoStart))
 			}
 		}(i + 1)
 	}
@@ -303,6 +328,22 @@ func main() {
 	}
 	close(repoChan)
 	wg.Wait()
+	log.Printf("all fetch phases complete; queued db operations=%d", len(writeOps))
+	sort.SliceStable(writeOps, func(i, j int) bool {
+		if writeOps[i].priority == writeOps[j].priority {
+			return writeOps[i].name < writeOps[j].name
+		}
+		return writeOps[i].priority < writeOps[j].priority
+	})
+	for idx, op := range writeOps {
+		started := time.Now()
+		log.Printf("db queue %d/%d start: %s (rows=%d)", idx+1, len(writeOps), op.name, op.rows)
+		if err := op.apply(db); err != nil {
+			recordErr(fmt.Sprintf("db write failed: %s", op.name), err)
+			continue
+		}
+		log.Printf("db queue %d/%d done: %s in %s", idx+1, len(writeOps), op.name, time.Since(started))
+	}
 
 	if err := exportCSVReport(db, runUUID, cfg.CSVOutputPath); err != nil {
 		runErr = fmt.Errorf("csv export failed: %w", err)
@@ -722,107 +763,93 @@ func upsertDependencyTx(tx *sql.Tx, ecosystem, name, version, purl, license, sup
 	return depID, nil
 }
 
-func ingestDependabotAlerts(ctx context.Context, client *github.Client, db *sql.DB, runUUID, org string, perPage int, repoIDByName map[string]int64) error {
-	alerts, err := fetchPaginated(ctx, client, fmt.Sprintf("orgs/%s/dependabot/alerts", org), perPage, func() interface{} {
-		return &[]dependabotAlert{}
-	})
-	if err != nil {
-		return err
+func fetchDependabotAlerts(ctx context.Context, client *github.Client, org string, perPage int) ([]*github.DependabotAlert, int, error) {
+	all := make([]*github.DependabotAlert, 0)
+	page := 1
+	pageCount := 0
+	for {
+		opts := &github.ListAlertsOptions{ListOptions: github.ListOptions{PerPage: perPage, Page: page}}
+		alerts, resp, err := client.Dependabot.ListOrgAlerts(ctx, org, opts)
+		if err != nil {
+			return nil, pageCount, err
+		}
+		pageCount++
+		all = append(all, alerts...)
+		log.Printf("dependabot page fetched: page=%d items=%d total=%d", page, len(alerts), len(all))
+		if resp.NextPage == 0 {
+			break
+		}
+		page = resp.NextPage
 	}
+	return all, pageCount, nil
+}
 
-	typed := alerts.([]dependabotAlert)
+func ingestDependabotAlerts(db *sql.DB, runUUID string, repoIDByName map[string]int64, alerts []*github.DependabotAlert) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	for _, a := range typed {
-		repoID, ok := resolveRepoID(repoIDByName, a.Repository.FullName, a.Repository.Name)
+	stmt, err := tx.Prepare(`
+		INSERT INTO dependabot_alerts(
+			run_uuid, repo_id, alert_number, state, severity, ecosystem, package_name,
+			manifest_path, created_at, updated_at, fixed_at, dismissed_reason, dependency_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(run_uuid, repo_id, alert_number) DO UPDATE SET
+			state = excluded.state,
+			severity = excluded.severity,
+			ecosystem = excluded.ecosystem,
+			package_name = excluded.package_name,
+			manifest_path = excluded.manifest_path,
+			created_at = excluded.created_at,
+			updated_at = excluded.updated_at,
+			fixed_at = excluded.fixed_at,
+			dismissed_reason = excluded.dismissed_reason,
+			dependency_id = excluded.dependency_id
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, a := range alerts {
+		if a == nil {
+			continue
+		}
+		repo := a.GetRepository()
+		repoID, ok := resolveRepoID(repoIDByName, repo.GetFullName(), repo.GetName())
 		if !ok {
 			continue
 		}
-		ecosystem := firstNonEmpty(a.Dependency.Package.Ecosystem, a.SecurityVulnerability.Package.Ecosystem)
-		pkgName := firstNonEmpty(a.Dependency.Package.Name, a.SecurityVulnerability.Package.Name)
-		severity := strings.ToLower(a.SecurityVulnerability.Severity)
+		dependency := a.GetDependency()
+		securityVuln := a.GetSecurityVulnerability()
+
+		depPackage := dependency.GetPackage()
+		secPackage := securityVuln.GetPackage()
+		ecosystem := firstNonEmpty(depPackage.GetEcosystem(), secPackage.GetEcosystem())
+		pkgName := firstNonEmpty(depPackage.GetName(), secPackage.GetName())
+		severity := strings.ToLower(securityVuln.GetSeverity())
 
 		depIDPtr, depErr := lookupDependencyIDTx(tx, ecosystem, pkgName)
 		if depErr != nil {
 			return depErr
 		}
 
-		_, err := tx.Exec(`
-			INSERT INTO dependabot_alerts(
-				run_uuid, repo_id, alert_number, state, severity, ecosystem, package_name,
-				manifest_path, created_at, updated_at, fixed_at, dismissed_reason, dependency_id
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(run_uuid, repo_id, alert_number) DO UPDATE SET
-				state = excluded.state,
-				severity = excluded.severity,
-				ecosystem = excluded.ecosystem,
-				package_name = excluded.package_name,
-				manifest_path = excluded.manifest_path,
-				created_at = excluded.created_at,
-				updated_at = excluded.updated_at,
-				fixed_at = excluded.fixed_at,
-				dismissed_reason = excluded.dismissed_reason,
-				dependency_id = excluded.dependency_id
-		`, runUUID, repoID, a.Number, a.State, severity, ecosystem, pkgName,
-			a.Dependency.ManifestPath, formatTime(a.CreatedAt), formatTime(a.UpdatedAt), formatTime(a.FixedAt), a.Dismissed, depIDPtr)
-		if err != nil {
-			return err
-		}
-	}
-
-	return tx.Commit()
-}
-
-func ingestCodeScanningAlerts(ctx context.Context, client *github.Client, db *sql.DB, runUUID, org string, perPage int, repoIDByName map[string]int64) error {
-	alerts, err := fetchPaginated(ctx, client, fmt.Sprintf("orgs/%s/code-scanning/alerts", org), perPage, func() interface{} {
-		return &[]codeScanningAlert{}
-	})
-	if err != nil {
-		return err
-	}
-	typed := alerts.([]codeScanningAlert)
-
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	for _, a := range typed {
-		repoID, ok := resolveRepoID(repoIDByName, a.Repository.FullName, a.Repository.Name)
-		if !ok {
-			continue
-		}
-		_, err := tx.Exec(`
-			INSERT INTO code_scanning_alerts(
-				run_uuid, repo_id, alert_number, state, rule_id, tool, severity,
-				security_severity, created_at, fixed_at, most_recent_instance_json
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(run_uuid, repo_id, alert_number) DO UPDATE SET
-				state = excluded.state,
-				rule_id = excluded.rule_id,
-				tool = excluded.tool,
-				severity = excluded.severity,
-				security_severity = excluded.security_severity,
-				created_at = excluded.created_at,
-				fixed_at = excluded.fixed_at,
-				most_recent_instance_json = excluded.most_recent_instance_json
-		`,
+		_, err := stmt.Exec(
 			runUUID,
 			repoID,
-			a.Number,
-			a.State,
-			a.Rule.ID,
-			a.Tool.Name,
-			a.Severity,
-			a.SecuritySeverityLevel,
-			formatTime(a.CreatedAt),
-			formatTime(a.FixedAt),
-			string(a.MostRecentInstance),
+			a.GetNumber(),
+			a.GetState(),
+			severity,
+			ecosystem,
+			pkgName,
+			dependency.GetManifestPath(),
+			formatGitHubTimePtr(a.CreatedAt),
+			formatGitHubTimePtr(a.UpdatedAt),
+			formatGitHubTimePtr(a.FixedAt),
+			a.GetDismissedReason(),
+			depIDPtr,
 		)
 		if err != nil {
 			return err
@@ -832,47 +859,93 @@ func ingestCodeScanningAlerts(ctx context.Context, client *github.Client, db *sq
 	return tx.Commit()
 }
 
-func ingestSecretScanningAlerts(ctx context.Context, client *github.Client, db *sql.DB, runUUID, org string, perPage int, repoIDByName map[string]int64) error {
-	alerts, err := fetchPaginated(ctx, client, fmt.Sprintf("orgs/%s/secret-scanning/alerts", org), perPage, func() interface{} {
-		return &[]secretScanningAlert{}
-	})
-	if err != nil {
-		return err
+func fetchCodeScanningAlerts(ctx context.Context, client *github.Client, org string, perPage int) ([]*github.Alert, int, error) {
+	all := make([]*github.Alert, 0)
+	page := 1
+	pageCount := 0
+	for {
+		opts := &github.AlertListOptions{ListOptions: github.ListOptions{PerPage: perPage, Page: page}}
+		alerts, resp, err := client.CodeScanning.ListAlertsForOrg(ctx, org, opts)
+		if err != nil {
+			return nil, pageCount, err
+		}
+		pageCount++
+		all = append(all, alerts...)
+		log.Printf("code scanning page fetched: page=%d items=%d total=%d", page, len(alerts), len(all))
+		if resp.NextPage == 0 {
+			break
+		}
+		page = resp.NextPage
 	}
-	typed := alerts.([]secretScanningAlert)
+	return all, pageCount, nil
+}
 
+func ingestCodeScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[string]int64, alerts []*github.Alert) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	for _, a := range typed {
-		repoID, ok := resolveRepoID(repoIDByName, a.Repository.FullName, a.Repository.Name)
+	stmt, err := tx.Prepare(`
+		INSERT INTO code_scanning_alerts(
+			run_uuid, repo_id, alert_number, state, rule_id, tool, severity,
+			security_severity, created_at, fixed_at, most_recent_instance_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(run_uuid, repo_id, alert_number) DO UPDATE SET
+			state = excluded.state,
+			rule_id = excluded.rule_id,
+			tool = excluded.tool,
+			severity = excluded.severity,
+			security_severity = excluded.security_severity,
+			created_at = excluded.created_at,
+			fixed_at = excluded.fixed_at,
+			most_recent_instance_json = excluded.most_recent_instance_json
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, a := range alerts {
+		if a == nil {
+			continue
+		}
+		repo := a.GetRepository()
+		repoID, ok := resolveRepoID(repoIDByName, repo.GetFullName(), repo.GetName())
 		if !ok {
 			continue
 		}
-		_, err := tx.Exec(`
-			INSERT INTO secret_scanning_alerts(
-				run_uuid, repo_id, alert_number, state, secret_type, resolution, created_at, updated_at, resolved_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(run_uuid, repo_id, alert_number) DO UPDATE SET
-				state = excluded.state,
-				secret_type = excluded.secret_type,
-				resolution = excluded.resolution,
-				created_at = excluded.created_at,
-				updated_at = excluded.updated_at,
-				resolved_at = excluded.resolved_at
-		`,
+		toolName := ""
+		if tool := a.GetTool(); tool != nil {
+			toolName = tool.GetName()
+		}
+		ruleID := ""
+		securitySeverity := ""
+		if rule := a.GetRule(); rule != nil {
+			ruleID = rule.GetID()
+			securitySeverity = rule.GetSeverity()
+		}
+		mostRecentInstanceJSON := ""
+		if a.GetMostRecentInstance() != nil {
+			raw, mErr := json.Marshal(a.GetMostRecentInstance())
+			if mErr != nil {
+				return mErr
+			}
+			mostRecentInstanceJSON = string(raw)
+		}
+		_, err := stmt.Exec(
 			runUUID,
 			repoID,
-			a.Number,
-			a.State,
-			a.SecretType,
-			a.Resolution,
-			formatTime(a.CreatedAt),
-			formatTime(a.UpdatedAt),
-			formatTime(a.ResolvedAt),
+			a.GetNumber(),
+			a.GetState(),
+			ruleID,
+			toolName,
+			a.GetRuleSeverity(),
+			securitySeverity,
+			formatGitHubTimePtr(a.CreatedAt),
+			formatGitHubTimePtr(a.FixedAt),
+			mostRecentInstanceJSON,
 		)
 		if err != nil {
 			return err
@@ -882,28 +955,104 @@ func ingestSecretScanningAlerts(ctx context.Context, client *github.Client, db *
 	return tx.Commit()
 }
 
-func fetchRepoRulesets(ctx context.Context, client *github.Client, owner, repo string, perPage int) ([]repoRuleset, error) {
-	data, err := fetchPaginated(ctx, client, fmt.Sprintf("repos/%s/%s/rulesets", owner, repo), perPage, func() interface{} {
-		return &[]json.RawMessage{}
-	})
-	if err != nil {
-		return nil, err
-	}
-	rawItems := data.([]json.RawMessage)
-
-	out := make([]repoRuleset, 0, len(rawItems))
-	for _, raw := range rawItems {
-		var rs repoRuleset
-		if err := json.Unmarshal(raw, &rs); err != nil {
-			return nil, err
+func fetchSecretScanningAlerts(ctx context.Context, client *github.Client, org string, perPage int) ([]*github.SecretScanningAlert, int, error) {
+	all := make([]*github.SecretScanningAlert, 0)
+	page := 1
+	pageCount := 0
+	for {
+		opts := &github.SecretScanningAlertListOptions{ListOptions: github.ListOptions{PerPage: perPage, Page: page}}
+		alerts, resp, err := client.SecretScanning.ListAlertsForOrg(ctx, org, opts)
+		if err != nil {
+			return nil, pageCount, err
 		}
-		rs.Raw = raw
-		out = append(out, rs)
+		pageCount++
+		all = append(all, alerts...)
+		log.Printf("secret scanning page fetched: page=%d items=%d total=%d", page, len(alerts), len(all))
+		if resp.NextPage == 0 {
+			break
+		}
+		page = resp.NextPage
 	}
-	return out, nil
+	return all, pageCount, nil
 }
 
-func ingestRepoRulesets(db *sql.DB, runUUID string, repoID int64, rulesets []repoRuleset) error {
+func ingestSecretScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[string]int64, alerts []*github.SecretScanningAlert) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO secret_scanning_alerts(
+			run_uuid, repo_id, alert_number, state, secret_type, resolution, created_at, updated_at, resolved_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(run_uuid, repo_id, alert_number) DO UPDATE SET
+			state = excluded.state,
+			secret_type = excluded.secret_type,
+			resolution = excluded.resolution,
+			created_at = excluded.created_at,
+			updated_at = excluded.updated_at,
+			resolved_at = excluded.resolved_at
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, a := range alerts {
+		if a == nil {
+			continue
+		}
+		repo := a.GetRepository()
+		repoID, ok := resolveRepoID(repoIDByName, repo.GetFullName(), repo.GetName())
+		if !ok {
+			continue
+		}
+		_, err := stmt.Exec(
+			runUUID,
+			repoID,
+			a.GetNumber(),
+			a.GetState(),
+			a.GetSecretType(),
+			a.GetResolution(),
+			formatGitHubTimePtr(a.CreatedAt),
+			formatGitHubTimePtr(a.UpdatedAt),
+			formatGitHubTimePtr(a.ResolvedAt),
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func fetchRepoRulesets(ctx context.Context, client *github.Client, owner, repo string, perPage int) ([]*github.RepositoryRuleset, int, error) {
+	all := make([]*github.RepositoryRuleset, 0)
+	page := 1
+	pageCount := 0
+	includeParents := true
+	for {
+		opts := &github.RepositoryListRulesetsOptions{
+			IncludesParents: &includeParents,
+			ListOptions:     github.ListOptions{PerPage: perPage, Page: page},
+		}
+		rulesets, resp, err := client.Repositories.GetAllRulesets(ctx, owner, repo, opts)
+		if err != nil {
+			return nil, pageCount, err
+		}
+		pageCount++
+		all = append(all, rulesets...)
+		if resp.NextPage == 0 {
+			break
+		}
+		page = resp.NextPage
+	}
+	return all, pageCount, nil
+}
+
+func ingestRepoRulesets(db *sql.DB, runUUID string, repoID int64, rulesets []*github.RepositoryRuleset) error {
 	if len(rulesets) == 0 {
 		return nil
 	}
@@ -913,15 +1062,33 @@ func ingestRepoRulesets(db *sql.DB, runUUID string, repoID int64, rulesets []rep
 	}
 	defer tx.Rollback()
 
+	stmt, err := tx.Prepare(`
+		INSERT INTO repo_rulesets(run_uuid, repo_id, ruleset_id, enforcement, target, raw_json)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(run_uuid, repo_id, ruleset_id) DO UPDATE SET
+			enforcement = excluded.enforcement,
+			target = excluded.target,
+			raw_json = excluded.raw_json
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
 	for _, rs := range rulesets {
-		_, err := tx.Exec(`
-			INSERT INTO repo_rulesets(run_uuid, repo_id, ruleset_id, enforcement, target, raw_json)
-			VALUES (?, ?, ?, ?, ?, ?)
-			ON CONFLICT(run_uuid, repo_id, ruleset_id) DO UPDATE SET
-				enforcement = excluded.enforcement,
-				target = excluded.target,
-				raw_json = excluded.raw_json
-		`, runUUID, repoID, rs.ID, rs.Enforcement, rs.Target, string(rs.Raw))
+		if rs == nil {
+			continue
+		}
+		raw, err := json.Marshal(rs)
+		if err != nil {
+			return err
+		}
+		enforcement := string(rs.Enforcement)
+		target := ""
+		if t := rs.GetTarget(); t != nil {
+			target = string(*t)
+		}
+		_, err = stmt.Exec(runUUID, repoID, rs.GetID(), enforcement, target, string(raw))
 		if err != nil {
 			return err
 		}
@@ -930,22 +1097,24 @@ func ingestRepoRulesets(db *sql.DB, runUUID string, repoID int64, rulesets []rep
 	return tx.Commit()
 }
 
-func fetchWorkflowRuns(ctx context.Context, client *github.Client, owner, repo string, perPage int) ([]*github.WorkflowRun, error) {
+func fetchWorkflowRuns(ctx context.Context, client *github.Client, owner, repo string, perPage int) ([]*github.WorkflowRun, int, error) {
 	all := make([]*github.WorkflowRun, 0)
 	page := 1
+	pageCount := 0
 	for {
 		opts := &github.ListWorkflowRunsOptions{ListOptions: github.ListOptions{PerPage: perPage, Page: page}}
 		runs, resp, err := client.Actions.ListRepositoryWorkflowRuns(ctx, owner, repo, opts)
 		if err != nil {
-			return nil, err
+			return nil, pageCount, err
 		}
+		pageCount++
 		all = append(all, runs.WorkflowRuns...)
 		if resp.NextPage == 0 {
 			break
 		}
 		page = resp.NextPage
 	}
-	return all, nil
+	return all, pageCount, nil
 }
 
 func ingestWorkflowRuns(db *sql.DB, runUUID string, repoID int64, runs []*github.WorkflowRun) error {
@@ -975,52 +1144,6 @@ func ingestWorkflowRuns(db *sql.DB, runUUID string, repoID int64, runs []*github
 	}
 
 	return tx.Commit()
-}
-
-func fetchPaginated(ctx context.Context, client *github.Client, endpoint string, perPage int, newSlicePtr func() interface{}) (interface{}, error) {
-	page := 1
-	accRaw := make([]json.RawMessage, 0)
-
-	for {
-		path := fmt.Sprintf("%s?per_page=%d&page=%d", endpoint, perPage, page)
-		req, err := client.NewRequest("GET", path, nil)
-		if err != nil {
-			return nil, err
-		}
-
-		pageBuf := &[]json.RawMessage{}
-		resp, err := client.Do(ctx, req, pageBuf)
-		if err != nil {
-			return nil, err
-		}
-		accRaw = append(accRaw, (*pageBuf)...)
-		if resp.NextPage == 0 {
-			break
-		}
-		page = resp.NextPage
-	}
-
-	result := newSlicePtr()
-	bytes, err := json.Marshal(accRaw)
-	if err != nil {
-		return nil, err
-	}
-	if err := json.Unmarshal(bytes, result); err != nil {
-		return nil, err
-	}
-
-	switch v := result.(type) {
-	case *[]dependabotAlert:
-		return *v, nil
-	case *[]codeScanningAlert:
-		return *v, nil
-	case *[]secretScanningAlert:
-		return *v, nil
-	case *[]json.RawMessage:
-		return *v, nil
-	default:
-		return nil, fmt.Errorf("unsupported pagination decode target")
-	}
 }
 
 func exportCSVReport(db *sql.DB, runUUID, outputPath string) error {
