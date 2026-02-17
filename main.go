@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/csv"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -41,29 +40,22 @@ type dbWriteOp struct {
 	apply    func(*sql.DB) error
 }
 
-type spdxDocument struct {
-	SPDXVersion  string `json:"spdxVersion"`
-	CreationInfo struct {
-		Created string `json:"created"`
-	} `json:"creationInfo"`
-	Packages      []spdxPackage `json:"packages"`
-	Relationships []struct {
-		SpdxElementID      string `json:"spdxElementId"`
-		RelationshipType   string `json:"relationshipType"`
-		RelatedSpdxElement string `json:"relatedSpdxElement"`
-	} `json:"relationships"`
+type schemaColumn struct {
+	name       string
+	definition string
 }
 
-type spdxPackage struct {
-	SPDXID           string      `json:"SPDXID"`
-	Name             string      `json:"name"`
-	VersionInfo      string      `json:"versionInfo"`
-	LicenseConcluded string      `json:"licenseConcluded"`
-	Supplier         interface{} `json:"supplier"`
-	ExternalRefs     []struct {
-		ReferenceType    string `json:"referenceType"`
-		ReferenceLocator string `json:"referenceLocator"`
-	} `json:"externalRefs"`
+type codeScanningInstanceSnapshot struct {
+	ref             string
+	commitSHA       string
+	path            string
+	startLine       interface{}
+	endLine         interface{}
+	startColumn     interface{}
+	endColumn       interface{}
+	state           string
+	category        string
+	classifications string
 }
 
 func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -412,10 +404,27 @@ func initSQLite(db *sql.DB) error {
 			default_branch TEXT,
 			language TEXT,
 			open_issues_count INTEGER,
+			description TEXT,
+			homepage TEXT,
+			topics TEXT,
+			size_kb INTEGER,
+			forks_count INTEGER,
+			stargazers_count INTEGER,
+			has_issues INTEGER,
+			has_projects INTEGER,
+			has_wiki INTEGER,
+			has_pages INTEGER,
+			has_discussions INTEGER,
+			is_fork INTEGER,
+			is_template INTEGER,
+			license_spdx_id TEXT,
+			advanced_security_status TEXT,
+			secret_scanning_status TEXT,
+			secret_scanning_push_protection_status TEXT,
+			dependabot_security_updates_status TEXT,
 			created_at TEXT,
 			updated_at TEXT,
 			pushed_at TEXT,
-			metadata_json TEXT,
 			PRIMARY KEY (run_uuid, repo_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS dependencies (
@@ -441,9 +450,16 @@ func initSQLite(db *sql.DB) error {
 			sbom_id INTEGER PRIMARY KEY AUTOINCREMENT,
 			run_uuid TEXT NOT NULL,
 			repo_id INTEGER NOT NULL,
+			spdx_id TEXT,
 			spdx_version TEXT,
+			document_name TEXT,
+			data_license TEXT,
+			document_namespace TEXT,
 			generated_at TEXT,
-			raw_json TEXT NOT NULL,
+			creation_creators TEXT,
+			document_describes_count INTEGER,
+			package_count INTEGER,
+			relationship_count INTEGER,
 			UNIQUE (run_uuid, repo_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS sbom_relationships (
@@ -485,7 +501,16 @@ func initSQLite(db *sql.DB) error {
 			security_severity TEXT,
 			created_at TEXT,
 			fixed_at TEXT,
-			most_recent_instance_json TEXT,
+			most_recent_ref TEXT,
+			most_recent_commit_sha TEXT,
+			most_recent_path TEXT,
+			most_recent_start_line INTEGER,
+			most_recent_end_line INTEGER,
+			most_recent_start_column INTEGER,
+			most_recent_end_column INTEGER,
+			most_recent_state TEXT,
+			most_recent_category TEXT,
+			most_recent_classifications TEXT,
 			PRIMARY KEY (run_uuid, repo_id, alert_number)
 		);`,
 		`CREATE TABLE IF NOT EXISTS secret_scanning_alerts (
@@ -504,9 +529,18 @@ func initSQLite(db *sql.DB) error {
 			run_uuid TEXT NOT NULL,
 			repo_id INTEGER NOT NULL,
 			ruleset_id INTEGER NOT NULL,
+			name TEXT,
 			enforcement TEXT,
 			target TEXT,
-			raw_json TEXT,
+			source TEXT,
+			source_type TEXT,
+			bypass_actor_count INTEGER,
+			current_user_can_bypass TEXT,
+			node_id TEXT,
+			created_at TEXT,
+			updated_at TEXT,
+			ref_name_includes TEXT,
+			ref_name_excludes TEXT,
 			PRIMARY KEY (run_uuid, repo_id, ruleset_id)
 		);`,
 	}
@@ -516,7 +550,116 @@ func initSQLite(db *sql.DB) error {
 			return err
 		}
 	}
+	return applySchemaMigrations(db)
+}
+
+func applySchemaMigrations(db *sql.DB) error {
+	migrations := map[string][]schemaColumn{
+		"repos": {
+			{name: "description", definition: "TEXT"},
+			{name: "homepage", definition: "TEXT"},
+			{name: "topics", definition: "TEXT"},
+			{name: "size_kb", definition: "INTEGER"},
+			{name: "forks_count", definition: "INTEGER"},
+			{name: "stargazers_count", definition: "INTEGER"},
+			{name: "has_issues", definition: "INTEGER"},
+			{name: "has_projects", definition: "INTEGER"},
+			{name: "has_wiki", definition: "INTEGER"},
+			{name: "has_pages", definition: "INTEGER"},
+			{name: "has_discussions", definition: "INTEGER"},
+			{name: "is_fork", definition: "INTEGER"},
+			{name: "is_template", definition: "INTEGER"},
+			{name: "license_spdx_id", definition: "TEXT"},
+			{name: "advanced_security_status", definition: "TEXT"},
+			{name: "secret_scanning_status", definition: "TEXT"},
+			{name: "secret_scanning_push_protection_status", definition: "TEXT"},
+			{name: "dependabot_security_updates_status", definition: "TEXT"},
+		},
+		"sbom_documents": {
+			{name: "spdx_id", definition: "TEXT"},
+			{name: "document_name", definition: "TEXT"},
+			{name: "data_license", definition: "TEXT"},
+			{name: "document_namespace", definition: "TEXT"},
+			{name: "creation_creators", definition: "TEXT"},
+			{name: "document_describes_count", definition: "INTEGER"},
+			{name: "package_count", definition: "INTEGER"},
+			{name: "relationship_count", definition: "INTEGER"},
+		},
+		"code_scanning_alerts": {
+			{name: "most_recent_ref", definition: "TEXT"},
+			{name: "most_recent_commit_sha", definition: "TEXT"},
+			{name: "most_recent_path", definition: "TEXT"},
+			{name: "most_recent_start_line", definition: "INTEGER"},
+			{name: "most_recent_end_line", definition: "INTEGER"},
+			{name: "most_recent_start_column", definition: "INTEGER"},
+			{name: "most_recent_end_column", definition: "INTEGER"},
+			{name: "most_recent_state", definition: "TEXT"},
+			{name: "most_recent_category", definition: "TEXT"},
+			{name: "most_recent_classifications", definition: "TEXT"},
+		},
+		"repo_rulesets": {
+			{name: "name", definition: "TEXT"},
+			{name: "source", definition: "TEXT"},
+			{name: "source_type", definition: "TEXT"},
+			{name: "bypass_actor_count", definition: "INTEGER"},
+			{name: "current_user_can_bypass", definition: "TEXT"},
+			{name: "node_id", definition: "TEXT"},
+			{name: "created_at", definition: "TEXT"},
+			{name: "updated_at", definition: "TEXT"},
+			{name: "ref_name_includes", definition: "TEXT"},
+			{name: "ref_name_excludes", definition: "TEXT"},
+		},
+	}
+
+	for table, cols := range migrations {
+		if err := ensureColumns(db, table, cols); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func ensureColumns(db *sql.DB, table string, cols []schemaColumn) error {
+	existing, err := tableColumns(db, table)
+	if err != nil {
+		return err
+	}
+	for _, col := range cols {
+		if _, ok := existing[col.name]; ok {
+			continue
+		}
+		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, col.name, col.definition)
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("failed adding column %s.%s: %w", table, col.name, err)
+		}
+	}
+	return nil
+}
+
+func tableColumns(db *sql.DB, table string) (map[string]struct{}, error) {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	cols := make(map[string]struct{})
+	for rows.Next() {
+		var cid int
+		var name string
+		var colType string
+		var notNull int
+		var defaultValue interface{}
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultValue, &pk); err != nil {
+			return nil, err
+		}
+		cols[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return cols, nil
 }
 
 func startIngestionRun(db *sql.DB, runUUID string) error {
@@ -530,15 +673,39 @@ func finishIngestionRun(db *sql.DB, runUUID, status, summary string) error {
 }
 
 func upsertRepo(db *sql.DB, runUUID, org string, repo *github.Repository) error {
-	meta, err := json.Marshal(repo)
-	if err != nil {
-		return err
+	topics := strings.Join(repo.Topics, ",")
+	licenseSPDX := ""
+	if repo.License != nil {
+		licenseSPDX = repo.License.GetSPDXID()
 	}
-	_, err = db.Exec(`
+	advancedSecurityStatus := ""
+	secretScanningStatus := ""
+	secretScanningPushProtectionStatus := ""
+	dependabotSecurityUpdatesStatus := ""
+	if repo.SecurityAndAnalysis != nil {
+		if repo.SecurityAndAnalysis.AdvancedSecurity != nil {
+			advancedSecurityStatus = repo.SecurityAndAnalysis.AdvancedSecurity.GetStatus()
+		}
+		if repo.SecurityAndAnalysis.SecretScanning != nil {
+			secretScanningStatus = repo.SecurityAndAnalysis.SecretScanning.GetStatus()
+		}
+		if repo.SecurityAndAnalysis.SecretScanningPushProtection != nil {
+			secretScanningPushProtectionStatus = repo.SecurityAndAnalysis.SecretScanningPushProtection.GetStatus()
+		}
+		if repo.SecurityAndAnalysis.DependabotSecurityUpdates != nil {
+			dependabotSecurityUpdatesStatus = repo.SecurityAndAnalysis.DependabotSecurityUpdates.GetStatus()
+		}
+	}
+
+	_, err := db.Exec(`
 		INSERT INTO repos(
 			run_uuid, repo_id, org_login, name, full_name, visibility, private, archived, disabled,
-			default_branch, language, open_issues_count, created_at, updated_at, pushed_at, metadata_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			default_branch, language, open_issues_count, description, homepage, topics,
+			size_kb, forks_count, stargazers_count, has_issues, has_projects, has_wiki, has_pages,
+			has_discussions, is_fork, is_template, license_spdx_id, advanced_security_status,
+			secret_scanning_status, secret_scanning_push_protection_status, dependabot_security_updates_status,
+			created_at, updated_at, pushed_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(run_uuid, repo_id) DO UPDATE SET
 			org_login = excluded.org_login,
 			name = excluded.name,
@@ -550,10 +717,27 @@ func upsertRepo(db *sql.DB, runUUID, org string, repo *github.Repository) error 
 			default_branch = excluded.default_branch,
 			language = excluded.language,
 			open_issues_count = excluded.open_issues_count,
+			description = excluded.description,
+			homepage = excluded.homepage,
+			topics = excluded.topics,
+			size_kb = excluded.size_kb,
+			forks_count = excluded.forks_count,
+			stargazers_count = excluded.stargazers_count,
+			has_issues = excluded.has_issues,
+			has_projects = excluded.has_projects,
+			has_wiki = excluded.has_wiki,
+			has_pages = excluded.has_pages,
+			has_discussions = excluded.has_discussions,
+			is_fork = excluded.is_fork,
+			is_template = excluded.is_template,
+			license_spdx_id = excluded.license_spdx_id,
+			advanced_security_status = excluded.advanced_security_status,
+			secret_scanning_status = excluded.secret_scanning_status,
+			secret_scanning_push_protection_status = excluded.secret_scanning_push_protection_status,
+			dependabot_security_updates_status = excluded.dependabot_security_updates_status,
 			created_at = excluded.created_at,
 			updated_at = excluded.updated_at,
-			pushed_at = excluded.pushed_at,
-			metadata_json = excluded.metadata_json
+			pushed_at = excluded.pushed_at
 	`,
 		runUUID,
 		repo.GetID(),
@@ -567,10 +751,27 @@ func upsertRepo(db *sql.DB, runUUID, org string, repo *github.Repository) error 
 		repo.GetDefaultBranch(),
 		repo.GetLanguage(),
 		repo.GetOpenIssuesCount(),
+		repo.GetDescription(),
+		repo.GetHomepage(),
+		topics,
+		repo.GetSize(),
+		repo.GetForksCount(),
+		repo.GetStargazersCount(),
+		boolToInt(repo.GetHasIssues()),
+		boolToInt(repo.GetHasProjects()),
+		boolToInt(repo.GetHasWiki()),
+		boolToInt(repo.GetHasPages()),
+		boolToInt(repo.GetHasDiscussions()),
+		boolToInt(repo.GetFork()),
+		boolToInt(repo.GetIsTemplate()),
+		licenseSPDX,
+		advancedSecurityStatus,
+		secretScanningStatus,
+		secretScanningPushProtectionStatus,
+		dependabotSecurityUpdatesStatus,
 		formatGitHubTimePtr(repo.CreatedAt),
 		formatGitHubTimePtr(repo.UpdatedAt),
 		formatGitHubTimePtr(repo.PushedAt),
-		string(meta),
 	)
 	return err
 }
@@ -616,15 +817,10 @@ func fetchAllRepos(ctx context.Context, client *github.Client, org string, perPa
 }
 
 func ingestSBOM(db *sql.DB, runUUID string, repoID int64, sbom *github.SBOM) error {
-	raw, err := json.Marshal(sbom)
-	if err != nil {
-		return err
+	if sbom == nil || sbom.SBOM == nil {
+		return nil
 	}
-
-	doc := spdxDocument{}
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return err
-	}
+	doc := sbom.SBOM
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -633,13 +829,36 @@ func ingestSBOM(db *sql.DB, runUUID string, repoID int64, sbom *github.SBOM) err
 	defer tx.Rollback()
 
 	_, err = tx.Exec(`
-		INSERT INTO sbom_documents(run_uuid, repo_id, spdx_version, generated_at, raw_json)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO sbom_documents(
+			run_uuid, repo_id, spdx_id, spdx_version, document_name, data_license,
+			document_namespace, generated_at, creation_creators, document_describes_count, package_count, relationship_count
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(run_uuid, repo_id) DO UPDATE SET
+			spdx_id = excluded.spdx_id,
 			spdx_version = excluded.spdx_version,
+			document_name = excluded.document_name,
+			data_license = excluded.data_license,
+			document_namespace = excluded.document_namespace,
 			generated_at = excluded.generated_at,
-			raw_json = excluded.raw_json
-	`, runUUID, repoID, doc.SPDXVersion, doc.CreationInfo.Created, string(raw))
+			creation_creators = excluded.creation_creators,
+			document_describes_count = excluded.document_describes_count,
+			package_count = excluded.package_count,
+			relationship_count = excluded.relationship_count
+	`,
+		runUUID,
+		repoID,
+		doc.GetSPDXID(),
+		doc.GetSPDXVersion(),
+		doc.GetName(),
+		doc.GetDataLicense(),
+		doc.GetDocumentNamespace(),
+		sbomCreatedAt(doc),
+		sbomCreators(doc),
+		len(doc.DocumentDescribes),
+		len(doc.Packages),
+		len(doc.Relationships),
+	)
 	if err != nil {
 		return err
 	}
@@ -651,16 +870,19 @@ func ingestSBOM(db *sql.DB, runUUID string, repoID int64, sbom *github.SBOM) err
 
 	pkgIDMap := make(map[string]int64, len(doc.Packages))
 	for _, pkg := range doc.Packages {
-		purl := extractPURL(pkg)
+		if pkg == nil {
+			continue
+		}
+		purl := extractPURLFromDependency(pkg)
 		ecosystem := ecosystemFromPURL(purl)
 		if ecosystem == "" {
 			ecosystem = "unknown"
 		}
-		depID, err := upsertDependencyTx(tx, ecosystem, pkg.Name, pkg.VersionInfo, purl, pkg.LicenseConcluded, supplierToString(pkg.Supplier))
+		depID, err := upsertDependencyTx(tx, ecosystem, pkg.GetName(), pkg.GetVersionInfo(), purl, pkg.GetLicenseConcluded(), "")
 		if err != nil {
 			return err
 		}
-		pkgIDMap[pkg.SPDXID] = depID
+		pkgIDMap[pkg.GetSPDXID()] = depID
 		if _, err := tx.Exec(`
 			INSERT OR IGNORE INTO repo_dependencies(run_uuid, repo_id, dependency_id, source, snapshot_at)
 			VALUES (?, ?, ?, ?, ?)
@@ -670,8 +892,11 @@ func ingestSBOM(db *sql.DB, runUUID string, repoID int64, sbom *github.SBOM) err
 	}
 
 	for _, rel := range doc.Relationships {
-		fromID, okFrom := pkgIDMap[rel.SpdxElementID]
-		toID, okTo := pkgIDMap[rel.RelatedSpdxElement]
+		if rel == nil {
+			continue
+		}
+		fromID, okFrom := pkgIDMap[rel.SPDXElementID]
+		toID, okTo := pkgIDMap[rel.RelatedSPDXElement]
 		if !okFrom && !okTo {
 			continue
 		}
@@ -877,8 +1102,10 @@ func ingestCodeScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[strin
 	stmt, err := tx.Prepare(`
 		INSERT INTO code_scanning_alerts(
 			run_uuid, repo_id, alert_number, state, rule_id, tool, severity,
-			security_severity, created_at, fixed_at, most_recent_instance_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			security_severity, created_at, fixed_at, most_recent_ref, most_recent_commit_sha,
+			most_recent_path, most_recent_start_line, most_recent_end_line, most_recent_start_column,
+			most_recent_end_column, most_recent_state, most_recent_category, most_recent_classifications
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(run_uuid, repo_id, alert_number) DO UPDATE SET
 			state = excluded.state,
 			rule_id = excluded.rule_id,
@@ -887,7 +1114,16 @@ func ingestCodeScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[strin
 			security_severity = excluded.security_severity,
 			created_at = excluded.created_at,
 			fixed_at = excluded.fixed_at,
-			most_recent_instance_json = excluded.most_recent_instance_json
+			most_recent_ref = excluded.most_recent_ref,
+			most_recent_commit_sha = excluded.most_recent_commit_sha,
+			most_recent_path = excluded.most_recent_path,
+			most_recent_start_line = excluded.most_recent_start_line,
+			most_recent_end_line = excluded.most_recent_end_line,
+			most_recent_start_column = excluded.most_recent_start_column,
+			most_recent_end_column = excluded.most_recent_end_column,
+			most_recent_state = excluded.most_recent_state,
+			most_recent_category = excluded.most_recent_category,
+			most_recent_classifications = excluded.most_recent_classifications
 	`)
 	if err != nil {
 		return err
@@ -915,14 +1151,7 @@ func ingestCodeScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[strin
 			ruleID = rule.GetID()
 			securitySeverity = rule.GetSecuritySeverityLevel()
 		}
-		mostRecentInstanceJSON := ""
-		if a.GetMostRecentInstance() != nil {
-			raw, mErr := json.Marshal(a.GetMostRecentInstance())
-			if mErr != nil {
-				return mErr
-			}
-			mostRecentInstanceJSON = string(raw)
-		}
+		instance := snapshotCodeScanningInstance(a.GetMostRecentInstance())
 		_, err := stmt.Exec(
 			runUUID,
 			repoID,
@@ -934,7 +1163,16 @@ func ingestCodeScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[strin
 			securitySeverity,
 			formatGitHubTimePtr(a.CreatedAt),
 			formatGitHubTimePtr(a.FixedAt),
-			mostRecentInstanceJSON,
+			instance.ref,
+			instance.commitSHA,
+			instance.path,
+			instance.startLine,
+			instance.endLine,
+			instance.startColumn,
+			instance.endColumn,
+			instance.state,
+			instance.category,
+			instance.classifications,
 		)
 		if err != nil {
 			return err
@@ -1077,12 +1315,24 @@ func ingestRepoRulesets(db *sql.DB, runUUID string, repoID int64, rulesets []*gi
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO repo_rulesets(run_uuid, repo_id, ruleset_id, enforcement, target, raw_json)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO repo_rulesets(
+			run_uuid, repo_id, ruleset_id, name, enforcement, target, source, source_type,
+			bypass_actor_count, current_user_can_bypass, node_id, created_at, updated_at, ref_name_includes, ref_name_excludes
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(run_uuid, repo_id, ruleset_id) DO UPDATE SET
+			name = excluded.name,
 			enforcement = excluded.enforcement,
 			target = excluded.target,
-			raw_json = excluded.raw_json
+			source = excluded.source,
+			source_type = excluded.source_type,
+			bypass_actor_count = excluded.bypass_actor_count,
+			current_user_can_bypass = excluded.current_user_can_bypass,
+			node_id = excluded.node_id,
+			created_at = excluded.created_at,
+			updated_at = excluded.updated_at,
+			ref_name_includes = excluded.ref_name_includes,
+			ref_name_excludes = excluded.ref_name_excludes
 	`)
 	if err != nil {
 		return err
@@ -1093,16 +1343,42 @@ func ingestRepoRulesets(db *sql.DB, runUUID string, repoID int64, rulesets []*gi
 		if rs == nil {
 			continue
 		}
-		raw, err := json.Marshal(rs)
-		if err != nil {
-			return err
-		}
 		enforcement := string(rs.Enforcement)
 		target := ""
 		if t := rs.GetTarget(); t != nil {
 			target = string(*t)
 		}
-		_, err = stmt.Exec(runUUID, repoID, rs.GetID(), enforcement, target, string(raw))
+		sourceType := ""
+		if st := rs.SourceType; st != nil {
+			sourceType = string(*st)
+		}
+		refNameIncludes := ""
+		refNameExcludes := ""
+		if rs.Conditions != nil && rs.Conditions.RefName != nil {
+			refNameIncludes = strings.Join(rs.Conditions.RefName.Include, ",")
+			refNameExcludes = strings.Join(rs.Conditions.RefName.Exclude, ",")
+		}
+		currentUserCanBypass := ""
+		if rs.CurrentUserCanBypass != nil {
+			currentUserCanBypass = string(*rs.CurrentUserCanBypass)
+		}
+		_, err = stmt.Exec(
+			runUUID,
+			repoID,
+			rs.GetID(),
+			rs.Name,
+			enforcement,
+			target,
+			rs.Source,
+			sourceType,
+			len(rs.BypassActors),
+			currentUserCanBypass,
+			rs.GetNodeID(),
+			formatGitHubTimePtr(rs.CreatedAt),
+			formatGitHubTimePtr(rs.UpdatedAt),
+			refNameIncludes,
+			refNameExcludes,
+		)
 		if err != nil {
 			return err
 		}
@@ -1123,16 +1399,40 @@ func exportCSVReport(db *sql.DB, runUUID, outputPath string) error {
 			r.private,
 			r.archived,
 			r.disabled,
-			r.default_branch,
-			r.language,
-			r.open_issues_count,
-			r.created_at AS repo_created_at,
-			r.updated_at AS repo_updated_at,
-			r.pushed_at AS repo_pushed_at,
-			r.metadata_json AS repo_metadata_json,
-			(SELECT sd.spdx_version FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_spdx_version,
-			(SELECT sd.generated_at FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_generated_at,
-			(SELECT sd.raw_json FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_raw_json,
+				r.default_branch,
+				r.language,
+				r.open_issues_count,
+				r.description,
+				r.homepage,
+				r.topics,
+				r.size_kb,
+				r.forks_count,
+				r.stargazers_count,
+				r.has_issues,
+				r.has_projects,
+				r.has_wiki,
+				r.has_pages,
+				r.has_discussions,
+				r.is_fork,
+				r.is_template,
+				r.license_spdx_id,
+				r.advanced_security_status,
+				r.secret_scanning_status,
+				r.secret_scanning_push_protection_status,
+				r.dependabot_security_updates_status,
+				r.created_at AS repo_created_at,
+				r.updated_at AS repo_updated_at,
+				r.pushed_at AS repo_pushed_at,
+				(SELECT sd.spdx_id FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_spdx_id,
+				(SELECT sd.spdx_version FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_spdx_version,
+				(SELECT sd.document_name FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_document_name,
+				(SELECT sd.data_license FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_data_license,
+				(SELECT sd.document_namespace FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_document_namespace,
+				(SELECT sd.generated_at FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_generated_at,
+				(SELECT sd.creation_creators FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_creation_creators,
+				(SELECT sd.document_describes_count FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_document_describes_count,
+				(SELECT sd.package_count FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_package_count,
+				(SELECT sd.relationship_count FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_relationship_count,
 			(SELECT COUNT(1) FROM repo_dependencies rd WHERE rd.run_uuid = ? AND rd.repo_id = r.repo_id) AS dependency_count,
 			(
 				SELECT COALESCE(group_concat(
@@ -1178,14 +1478,17 @@ func exportCSVReport(db *sql.DB, runUUID, outputPath string) error {
 					';state=' || COALESCE(ca.state, '') ||
 					';rule_id=' || COALESCE(ca.rule_id, '') ||
 					';tool=' || COALESCE(ca.tool, '') ||
-					';severity=' || COALESCE(ca.severity, '') ||
-					';security_severity=' || COALESCE(ca.security_severity, '') ||
-					';created_at=' || COALESCE(ca.created_at, '') ||
-					';fixed_at=' || COALESCE(ca.fixed_at, '') ||
-					';most_recent_instance_json=' || COALESCE(ca.most_recent_instance_json, ''),
-					char(10)
-				), '')
-				FROM code_scanning_alerts ca
+						';severity=' || COALESCE(ca.severity, '') ||
+						';security_severity=' || COALESCE(ca.security_severity, '') ||
+						';created_at=' || COALESCE(ca.created_at, '') ||
+						';fixed_at=' || COALESCE(ca.fixed_at, '') ||
+						';most_recent_ref=' || COALESCE(ca.most_recent_ref, '') ||
+						';most_recent_commit_sha=' || COALESCE(ca.most_recent_commit_sha, '') ||
+						';most_recent_path=' || COALESCE(ca.most_recent_path, '') ||
+						';most_recent_state=' || COALESCE(ca.most_recent_state, ''),
+						char(10)
+					), '')
+					FROM code_scanning_alerts ca
 				WHERE ca.run_uuid = ? AND ca.repo_id = r.repo_id
 			) AS code_scanning_alert_details,
 			(SELECT COUNT(1) FROM secret_scanning_alerts sa WHERE sa.run_uuid = ? AND sa.repo_id = r.repo_id AND lower(sa.state) = 'open') AS open_secret_scanning_alerts,
@@ -1206,14 +1509,18 @@ func exportCSVReport(db *sql.DB, runUUID, outputPath string) error {
 			) AS secret_scanning_alert_details,
 			(SELECT COUNT(1) FROM repo_rulesets rr WHERE rr.run_uuid = ? AND rr.repo_id = r.repo_id) AS total_rulesets,
 				(
-					SELECT COALESCE(group_concat(
-						'ruleset_id=' || rr.ruleset_id ||
-						';enforcement=' || COALESCE(rr.enforcement, '') ||
-						';target=' || COALESCE(rr.target, '') ||
-						';raw_json=' || COALESCE(rr.raw_json, ''),
-						char(10)
-					), '')
-					FROM repo_rulesets rr
+						SELECT COALESCE(group_concat(
+							'ruleset_id=' || rr.ruleset_id ||
+							';name=' || COALESCE(rr.name, '') ||
+							';enforcement=' || COALESCE(rr.enforcement, '') ||
+							';target=' || COALESCE(rr.target, '') ||
+							';source=' || COALESCE(rr.source, '') ||
+							';source_type=' || COALESCE(rr.source_type, '') ||
+							';created_at=' || COALESCE(rr.created_at, '') ||
+							';updated_at=' || COALESCE(rr.updated_at, ''),
+							char(10)
+						), '')
+						FROM repo_rulesets rr
 					WHERE rr.run_uuid = ? AND rr.repo_id = r.repo_id
 				) AS ruleset_details
 			FROM repos r
@@ -1223,9 +1530,16 @@ func exportCSVReport(db *sql.DB, runUUID, outputPath string) error {
 
 	rows, err := db.Query(
 		query,
+		runUUID, // sbom_spdx_id
 		runUUID, // sbom_spdx_version
+		runUUID, // sbom_document_name
+		runUUID, // sbom_data_license
+		runUUID, // sbom_document_namespace
 		runUUID, // sbom_generated_at
-		runUUID, // sbom_raw_json
+		runUUID, // sbom_creation_creators
+		runUUID, // sbom_document_describes_count
+		runUUID, // sbom_package_count
+		runUUID, // sbom_relationship_count
 		runUUID, // dependency_count
 		runUUID, // dependency_details
 		runUUID, // open_dependabot_alerts
@@ -1349,8 +1663,14 @@ func secretScanningAlertKey(a *github.SecretScanningAlert) string {
 	return fmt.Sprintf("unknown:%d", a.GetNumber())
 }
 
-func extractPURL(pkg spdxPackage) string {
+func extractPURLFromDependency(pkg *github.RepoDependencies) string {
+	if pkg == nil {
+		return ""
+	}
 	for _, ref := range pkg.ExternalRefs {
+		if ref == nil {
+			continue
+		}
 		if strings.EqualFold(ref.ReferenceType, "purl") || strings.EqualFold(ref.ReferenceType, "package-manager") {
 			return ref.ReferenceLocator
 		}
@@ -1376,20 +1696,45 @@ func ecosystemFromPURL(purl string) string {
 	return rest[:end]
 }
 
-func supplierToString(v interface{}) string {
-	if v == nil {
+func sbomCreatedAt(doc *github.SBOMInfo) string {
+	if doc == nil || doc.CreationInfo == nil {
 		return ""
 	}
-	switch t := v.(type) {
-	case string:
-		return t
-	default:
-		b, err := json.Marshal(t)
-		if err != nil {
-			return ""
-		}
-		return string(b)
+	return formatGitHubTimePtr(doc.CreationInfo.Created)
+}
+
+func sbomCreators(doc *github.SBOMInfo) string {
+	if doc == nil || doc.CreationInfo == nil {
+		return ""
 	}
+	return strings.Join(doc.CreationInfo.Creators, ",")
+}
+
+func nullableInt(v int) interface{} {
+	if v == 0 {
+		return nil
+	}
+	return v
+}
+
+func snapshotCodeScanningInstance(inst *github.MostRecentInstance) codeScanningInstanceSnapshot {
+	s := codeScanningInstanceSnapshot{}
+	if inst == nil {
+		return s
+	}
+	s.ref = inst.GetRef()
+	s.commitSHA = inst.GetCommitSHA()
+	s.state = inst.GetState()
+	s.category = inst.GetCategory()
+	s.classifications = strings.Join(inst.Classifications, ",")
+	if inst.Location != nil {
+		s.path = inst.Location.GetPath()
+		s.startLine = nullableInt(inst.Location.GetStartLine())
+		s.endLine = nullableInt(inst.Location.GetEndLine())
+		s.startColumn = nullableInt(inst.Location.GetStartColumn())
+		s.endColumn = nullableInt(inst.Location.GetEndColumn())
+	}
+	return s
 }
 
 func lookupDependencyIDTx(tx *sql.Tx, ecosystem, name string) (interface{}, error) {
