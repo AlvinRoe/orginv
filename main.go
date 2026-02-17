@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/csv"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -135,14 +134,6 @@ func main() {
 		}
 	}()
 
-	orgInfo, _, err := client.Organizations.Get(ctx, cfg.Org)
-	if err != nil {
-		log.Printf("warning: failed to fetch org metadata: %v", err)
-	}
-	if err := upsertOrg(db, runUUID, cfg.Org, orgInfo); err != nil {
-		log.Fatalf("failed to upsert org: %v", err)
-	}
-
 	repos, err := fetchAllRepos(ctx, client, cfg.Org, cfg.ResultsPerPage)
 	if err != nil {
 		log.Fatalf("failed to fetch repositories: %v", err)
@@ -174,7 +165,7 @@ func main() {
 		errorsSeen = append(errorsSeen, fmt.Sprintf("%s: %v", msg, err))
 		log.Printf("%s: %v", msg, err)
 	}
-	writeOps := make([]dbWriteOp, 0, len(activeRepos)*3+3)
+	writeOps := make([]dbWriteOp, 0, len(activeRepos)*2+3)
 	var writeOpsMu sync.Mutex
 	enqueueWriteOp := func(op dbWriteOp) {
 		writeOpsMu.Lock()
@@ -261,7 +252,7 @@ func main() {
 	}
 	orgWG.Wait()
 
-	log.Printf("fetching per-repo datasets (sbom, rulesets, workflow runs)")
+	log.Printf("fetching per-repo datasets (sbom, rulesets)")
 	const repoWorkers = 10
 	repoChan := make(chan *github.Repository, len(activeRepos))
 	var wg sync.WaitGroup
@@ -305,20 +296,6 @@ func main() {
 					})
 				}
 
-				runs, pages, wErr := fetchWorkflowRuns(ctx, client, cfg.Org, repoName, cfg.ResultsPerPage)
-				if wErr != nil {
-					recordErr(fmt.Sprintf("worker %d workflow runs %s", workerID, repoName), wErr)
-				} else {
-					log.Printf("worker %d workflow runs fetched for %s: pages=%d runs=%d", workerID, repoName, pages, len(runs))
-					enqueueWriteOp(dbWriteOp{
-						name:     fmt.Sprintf("workflow runs %s", repoName),
-						priority: 20,
-						rows:     len(runs),
-						apply: func(execDB *sql.DB) error {
-							return ingestWorkflowRuns(execDB, runUUID, repoID, runs)
-						},
-					})
-				}
 				log.Printf("worker %d fetch complete for repo %s in %s", workerID, repoName, time.Since(repoStart))
 			}
 		}(i + 1)
@@ -421,14 +398,6 @@ func initSQLite(db *sql.DB) error {
 			finished_at TEXT,
 			status TEXT,
 			error_summary TEXT
-		);`,
-		`CREATE TABLE IF NOT EXISTS orgs (
-			run_uuid TEXT NOT NULL,
-			org_id INTEGER,
-			login TEXT NOT NULL,
-			name TEXT,
-			snapshot_at TEXT NOT NULL,
-			PRIMARY KEY (run_uuid, login)
 		);`,
 		`CREATE TABLE IF NOT EXISTS repos (
 			run_uuid TEXT NOT NULL,
@@ -540,17 +509,6 @@ func initSQLite(db *sql.DB) error {
 			raw_json TEXT,
 			PRIMARY KEY (run_uuid, repo_id, ruleset_id)
 		);`,
-		`CREATE TABLE IF NOT EXISTS workflow_runs (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			run_id INTEGER NOT NULL,
-			workflow_name TEXT,
-			status TEXT,
-			conclusion TEXT,
-			run_started_at TEXT,
-			updated_at TEXT,
-			PRIMARY KEY (run_uuid, repo_id, run_id)
-		);`,
 	}
 
 	for _, stmt := range schema {
@@ -568,21 +526,6 @@ func startIngestionRun(db *sql.DB, runUUID string) error {
 
 func finishIngestionRun(db *sql.DB, runUUID, status, summary string) error {
 	_, err := db.Exec(`UPDATE ingestion_runs SET finished_at = ?, status = ?, error_summary = ? WHERE run_uuid = ?`, time.Now().UTC().Format(time.RFC3339), status, summary, runUUID)
-	return err
-}
-
-func upsertOrg(db *sql.DB, runUUID, org string, orgInfo *github.Organization) error {
-	orgID := int64(0)
-	name := ""
-	if orgInfo != nil {
-		orgID = orgInfo.GetID()
-		name = orgInfo.GetName()
-	}
-	_, err := db.Exec(`
-		INSERT INTO orgs(run_uuid, org_id, login, name, snapshot_at)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(run_uuid, login) DO UPDATE SET org_id = excluded.org_id, name = excluded.name, snapshot_at = excluded.snapshot_at
-	`, runUUID, orgID, org, name, time.Now().UTC().Format(time.RFC3339))
 	return err
 }
 
@@ -766,21 +709,40 @@ func upsertDependencyTx(tx *sql.Tx, ecosystem, name, version, purl, license, sup
 
 func fetchDependabotAlerts(ctx context.Context, client *github.Client, org string, perPage int) ([]*github.DependabotAlert, int, error) {
 	all := make([]*github.DependabotAlert, 0)
-	page := 1
 	pageCount := 0
-	for {
-		opts := &github.ListAlertsOptions{ListOptions: github.ListOptions{PerPage: perPage, Page: page}}
-		alerts, resp, err := client.Dependabot.ListOrgAlerts(ctx, org, opts)
-		if err != nil {
-			return nil, pageCount, fmt.Errorf("dependabot org alerts fetch failed (org=%s page=%d): %s", org, page, formatGitHubAPIError(err))
+	seen := make(map[string]struct{})
+	states := []string{"open", "dismissed", "fixed", "auto_dismissed"}
+	for _, state := range states {
+		page := 1
+		for {
+			opts := &github.ListAlertsOptions{
+				State:       stringPtr(state),
+				ListOptions: github.ListOptions{PerPage: perPage, Page: page},
+			}
+			alerts, resp, err := client.Dependabot.ListOrgAlerts(ctx, org, opts)
+			if err != nil {
+				return nil, pageCount, fmt.Errorf("dependabot org alerts fetch failed (org=%s state=%s page=%d): %w", org, state, page, err)
+			}
+			pageCount++
+			added := 0
+			for _, alert := range alerts {
+				if alert == nil {
+					continue
+				}
+				key := dependabotAlertKey(alert)
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				all = append(all, alert)
+				added++
+			}
+			log.Printf("dependabot page fetched: state=%s page=%d items=%d added=%d total=%d", state, page, len(alerts), added, len(all))
+			if resp.NextPage == 0 {
+				break
+			}
+			page = resp.NextPage
 		}
-		pageCount++
-		all = append(all, alerts...)
-		log.Printf("dependabot page fetched: page=%d items=%d total=%d", page, len(alerts), len(all))
-		if resp.NextPage == 0 {
-			break
-		}
-		page = resp.NextPage
 	}
 	return all, pageCount, nil
 }
@@ -814,23 +776,26 @@ func ingestDependabotAlerts(db *sql.DB, runUUID string, repoIDByName map[string]
 	}
 	defer stmt.Close()
 
+	inserted := 0
+	skippedRepo := 0
 	for _, a := range alerts {
 		if a == nil {
 			continue
 		}
-		repo := a.GetRepository()
-		repoID, ok := resolveRepoID(repoIDByName, repo.GetFullName(), repo.GetName())
+		repoID, ok := resolveAlertRepoID(repoIDByName, a.GetRepository())
 		if !ok {
+			skippedRepo++
 			continue
 		}
 		dependency := a.GetDependency()
 		securityVuln := a.GetSecurityVulnerability()
+		securityAdv := a.GetSecurityAdvisory()
 
 		depPackage := dependency.GetPackage()
 		secPackage := securityVuln.GetPackage()
 		ecosystem := firstNonEmpty(depPackage.GetEcosystem(), secPackage.GetEcosystem())
 		pkgName := firstNonEmpty(depPackage.GetName(), secPackage.GetName())
-		severity := strings.ToLower(securityVuln.GetSeverity())
+		severity := strings.ToLower(firstNonEmpty(securityVuln.GetSeverity(), securityAdv.GetSeverity()))
 
 		depIDPtr, depErr := lookupDependencyIDTx(tx, ecosystem, pkgName)
 		if depErr != nil {
@@ -855,28 +820,49 @@ func ingestDependabotAlerts(db *sql.DB, runUUID string, repoIDByName map[string]
 		if err != nil {
 			return err
 		}
+		inserted++
 	}
+	log.Printf("dependabot ingest summary: total=%d inserted=%d skipped_repo=%d", len(alerts), inserted, skippedRepo)
 
 	return tx.Commit()
 }
 
 func fetchCodeScanningAlerts(ctx context.Context, client *github.Client, org string, perPage int) ([]*github.Alert, int, error) {
 	all := make([]*github.Alert, 0)
-	page := 1
 	pageCount := 0
-	for {
-		opts := &github.AlertListOptions{ListOptions: github.ListOptions{PerPage: perPage, Page: page}}
-		alerts, resp, err := client.CodeScanning.ListAlertsForOrg(ctx, org, opts)
-		if err != nil {
-			return nil, pageCount, fmt.Errorf("code scanning org alerts fetch failed (org=%s page=%d): %s", org, page, formatGitHubAPIError(err))
+	seen := make(map[string]struct{})
+	states := []string{"open", "closed"}
+	for _, state := range states {
+		page := 1
+		for {
+			opts := &github.AlertListOptions{
+				State:       state,
+				ListOptions: github.ListOptions{PerPage: perPage, Page: page},
+			}
+			alerts, resp, err := client.CodeScanning.ListAlertsForOrg(ctx, org, opts)
+			if err != nil {
+				return nil, pageCount, fmt.Errorf("code scanning org alerts fetch failed (org=%s state=%s page=%d): %w", org, state, page, err)
+			}
+			pageCount++
+			added := 0
+			for _, alert := range alerts {
+				if alert == nil {
+					continue
+				}
+				key := codeScanningAlertKey(alert)
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				all = append(all, alert)
+				added++
+			}
+			log.Printf("code scanning page fetched: state=%s page=%d items=%d added=%d total=%d", state, page, len(alerts), added, len(all))
+			if resp.NextPage == 0 {
+				break
+			}
+			page = resp.NextPage
 		}
-		pageCount++
-		all = append(all, alerts...)
-		log.Printf("code scanning page fetched: page=%d items=%d total=%d", page, len(alerts), len(all))
-		if resp.NextPage == 0 {
-			break
-		}
-		page = resp.NextPage
 	}
 	return all, pageCount, nil
 }
@@ -908,13 +894,15 @@ func ingestCodeScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[strin
 	}
 	defer stmt.Close()
 
+	inserted := 0
+	skippedRepo := 0
 	for _, a := range alerts {
 		if a == nil {
 			continue
 		}
-		repo := a.GetRepository()
-		repoID, ok := resolveRepoID(repoIDByName, repo.GetFullName(), repo.GetName())
+		repoID, ok := resolveAlertRepoID(repoIDByName, a.GetRepository())
 		if !ok {
+			skippedRepo++
 			continue
 		}
 		toolName := ""
@@ -925,7 +913,7 @@ func ingestCodeScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[strin
 		securitySeverity := ""
 		if rule := a.GetRule(); rule != nil {
 			ruleID = rule.GetID()
-			securitySeverity = rule.GetSeverity()
+			securitySeverity = rule.GetSecuritySeverityLevel()
 		}
 		mostRecentInstanceJSON := ""
 		if a.GetMostRecentInstance() != nil {
@@ -951,28 +939,49 @@ func ingestCodeScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[strin
 		if err != nil {
 			return err
 		}
+		inserted++
 	}
+	log.Printf("code scanning ingest summary: total=%d inserted=%d skipped_repo=%d", len(alerts), inserted, skippedRepo)
 
 	return tx.Commit()
 }
 
 func fetchSecretScanningAlerts(ctx context.Context, client *github.Client, org string, perPage int) ([]*github.SecretScanningAlert, int, error) {
 	all := make([]*github.SecretScanningAlert, 0)
-	page := 1
 	pageCount := 0
-	for {
-		opts := &github.SecretScanningAlertListOptions{ListOptions: github.ListOptions{PerPage: perPage, Page: page}}
-		alerts, resp, err := client.SecretScanning.ListAlertsForOrg(ctx, org, opts)
-		if err != nil {
-			return nil, pageCount, fmt.Errorf("secret scanning org alerts fetch failed (org=%s page=%d): %s", org, page, formatGitHubAPIError(err))
+	seen := make(map[string]struct{})
+	states := []string{"open", "resolved"}
+	for _, state := range states {
+		page := 1
+		for {
+			opts := &github.SecretScanningAlertListOptions{
+				State:       state,
+				ListOptions: github.ListOptions{PerPage: perPage, Page: page},
+			}
+			alerts, resp, err := client.SecretScanning.ListAlertsForOrg(ctx, org, opts)
+			if err != nil {
+				return nil, pageCount, fmt.Errorf("secret scanning org alerts fetch failed (org=%s state=%s page=%d): %w", org, state, page, err)
+			}
+			pageCount++
+			added := 0
+			for _, alert := range alerts {
+				if alert == nil {
+					continue
+				}
+				key := secretScanningAlertKey(alert)
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				all = append(all, alert)
+				added++
+			}
+			log.Printf("secret scanning page fetched: state=%s page=%d items=%d added=%d total=%d", state, page, len(alerts), added, len(all))
+			if resp.NextPage == 0 {
+				break
+			}
+			page = resp.NextPage
 		}
-		pageCount++
-		all = append(all, alerts...)
-		log.Printf("secret scanning page fetched: page=%d items=%d total=%d", page, len(alerts), len(all))
-		if resp.NextPage == 0 {
-			break
-		}
-		page = resp.NextPage
 	}
 	return all, pageCount, nil
 }
@@ -1001,13 +1010,15 @@ func ingestSecretScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[str
 	}
 	defer stmt.Close()
 
+	inserted := 0
+	skippedRepo := 0
 	for _, a := range alerts {
 		if a == nil {
 			continue
 		}
-		repo := a.GetRepository()
-		repoID, ok := resolveRepoID(repoIDByName, repo.GetFullName(), repo.GetName())
+		repoID, ok := resolveAlertRepoID(repoIDByName, a.GetRepository())
 		if !ok {
+			skippedRepo++
 			continue
 		}
 		_, err := stmt.Exec(
@@ -1024,7 +1035,9 @@ func ingestSecretScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[str
 		if err != nil {
 			return err
 		}
+		inserted++
 	}
+	log.Printf("secret scanning ingest summary: total=%d inserted=%d skipped_repo=%d", len(alerts), inserted, skippedRepo)
 
 	return tx.Commit()
 }
@@ -1090,55 +1103,6 @@ func ingestRepoRulesets(db *sql.DB, runUUID string, repoID int64, rulesets []*gi
 			target = string(*t)
 		}
 		_, err = stmt.Exec(runUUID, repoID, rs.GetID(), enforcement, target, string(raw))
-		if err != nil {
-			return err
-		}
-	}
-
-	return tx.Commit()
-}
-
-func fetchWorkflowRuns(ctx context.Context, client *github.Client, owner, repo string, perPage int) ([]*github.WorkflowRun, int, error) {
-	all := make([]*github.WorkflowRun, 0)
-	page := 1
-	pageCount := 0
-	for {
-		opts := &github.ListWorkflowRunsOptions{ListOptions: github.ListOptions{PerPage: perPage, Page: page}}
-		runs, resp, err := client.Actions.ListRepositoryWorkflowRuns(ctx, owner, repo, opts)
-		if err != nil {
-			return nil, pageCount, err
-		}
-		pageCount++
-		all = append(all, runs.WorkflowRuns...)
-		if resp.NextPage == 0 {
-			break
-		}
-		page = resp.NextPage
-	}
-	return all, pageCount, nil
-}
-
-func ingestWorkflowRuns(db *sql.DB, runUUID string, repoID int64, runs []*github.WorkflowRun) error {
-	if len(runs) == 0 {
-		return nil
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	for _, run := range runs {
-		_, err := tx.Exec(`
-			INSERT INTO workflow_runs(run_uuid, repo_id, run_id, workflow_name, status, conclusion, run_started_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(run_uuid, repo_id, run_id) DO UPDATE SET
-				workflow_name = excluded.workflow_name,
-				status = excluded.status,
-				conclusion = excluded.conclusion,
-				run_started_at = excluded.run_started_at,
-				updated_at = excluded.updated_at
-		`, runUUID, repoID, run.GetID(), run.GetName(), run.GetStatus(), run.GetConclusion(), formatGitHubTimePtr(run.RunStartedAt), formatGitHubTimePtr(run.UpdatedAt))
 		if err != nil {
 			return err
 		}
@@ -1241,34 +1205,19 @@ func exportCSVReport(db *sql.DB, runUUID, outputPath string) error {
 				WHERE sa.run_uuid = ? AND sa.repo_id = r.repo_id
 			) AS secret_scanning_alert_details,
 			(SELECT COUNT(1) FROM repo_rulesets rr WHERE rr.run_uuid = ? AND rr.repo_id = r.repo_id) AS total_rulesets,
-			(
-				SELECT COALESCE(group_concat(
-					'ruleset_id=' || rr.ruleset_id ||
-					';enforcement=' || COALESCE(rr.enforcement, '') ||
-					';target=' || COALESCE(rr.target, '') ||
-					';raw_json=' || COALESCE(rr.raw_json, ''),
-					char(10)
-				), '')
-				FROM repo_rulesets rr
-				WHERE rr.run_uuid = ? AND rr.repo_id = r.repo_id
-			) AS ruleset_details,
-			(SELECT COUNT(1) FROM workflow_runs wr WHERE wr.run_uuid = ? AND wr.repo_id = r.repo_id AND lower(COALESCE(wr.conclusion, '')) = 'failure') AS failed_workflow_runs,
-			(SELECT COUNT(1) FROM workflow_runs wr WHERE wr.run_uuid = ? AND wr.repo_id = r.repo_id) AS total_workflow_runs,
-			(
-				SELECT COALESCE(group_concat(
-					'run_id=' || wr.run_id ||
-					';workflow_name=' || COALESCE(wr.workflow_name, '') ||
-					';status=' || COALESCE(wr.status, '') ||
-					';conclusion=' || COALESCE(wr.conclusion, '') ||
-					';run_started_at=' || COALESCE(wr.run_started_at, '') ||
-					';updated_at=' || COALESCE(wr.updated_at, ''),
-					char(10)
-				), '')
-				FROM workflow_runs wr
-				WHERE wr.run_uuid = ? AND wr.repo_id = r.repo_id
-			) AS workflow_run_details
-		FROM repos r
-		WHERE r.run_uuid = ?
+				(
+					SELECT COALESCE(group_concat(
+						'ruleset_id=' || rr.ruleset_id ||
+						';enforcement=' || COALESCE(rr.enforcement, '') ||
+						';target=' || COALESCE(rr.target, '') ||
+						';raw_json=' || COALESCE(rr.raw_json, ''),
+						char(10)
+					), '')
+					FROM repo_rulesets rr
+					WHERE rr.run_uuid = ? AND rr.repo_id = r.repo_id
+				) AS ruleset_details
+			FROM repos r
+			WHERE r.run_uuid = ?
 		ORDER BY open_critical_dependabot_alerts DESC, open_dependabot_alerts DESC, r.full_name ASC
 	`
 
@@ -1291,9 +1240,6 @@ func exportCSVReport(db *sql.DB, runUUID, outputPath string) error {
 		runUUID, // secret_scanning_alert_details
 		runUUID, // total_rulesets
 		runUUID, // ruleset_details
-		runUUID, // failed_workflow_runs
-		runUUID, // total_workflow_runs
-		runUUID, // workflow_run_details
 		runUUID, // repos filter
 	)
 	if err != nil {
@@ -1341,18 +1287,66 @@ func exportCSVReport(db *sql.DB, runUUID, outputPath string) error {
 	return nil
 }
 
-func resolveRepoID(repoIDByName map[string]int64, fullName, name string) (int64, bool) {
-	if fullName != "" {
-		if id, ok := repoIDByName[fullName]; ok {
-			return id, true
+func stringPtr(v string) *string {
+	return &v
+}
+
+func resolveAlertRepoID(repoIDByName map[string]int64, repo *github.Repository) (int64, bool) {
+	if repo != nil {
+		if repoID := repo.GetID(); repoID != 0 {
+			return repoID, true
 		}
-	}
-	if name != "" {
-		if id, ok := repoIDByName[name]; ok {
-			return id, true
+		if fullName := repo.GetFullName(); fullName != "" {
+			if id, ok := repoIDByName[fullName]; ok {
+				return id, true
+			}
+		}
+		if name := repo.GetName(); name != "" {
+			if id, ok := repoIDByName[name]; ok {
+				return id, true
+			}
 		}
 	}
 	return 0, false
+}
+
+func dependabotAlertKey(a *github.DependabotAlert) string {
+	if a == nil {
+		return ""
+	}
+	repo := a.GetRepository()
+	if repo != nil && repo.GetID() != 0 {
+		return fmt.Sprintf("%d:%d", repo.GetID(), a.GetNumber())
+	}
+	return firstNonEmpty(a.GetHTMLURL(), a.GetURL(), fmt.Sprintf("unknown:%d", a.GetNumber()))
+}
+
+func codeScanningAlertKey(a *github.Alert) string {
+	if a == nil {
+		return ""
+	}
+	repo := a.GetRepository()
+	if repo != nil && repo.GetID() != 0 {
+		return fmt.Sprintf("%d:%d", repo.GetID(), a.GetNumber())
+	}
+	if a.GetHTMLURL() != "" {
+		return a.GetHTMLURL()
+	}
+	return fmt.Sprintf("unknown:%d", a.GetNumber())
+}
+
+func secretScanningAlertKey(a *github.SecretScanningAlert) string {
+	if a == nil {
+		return ""
+	}
+	repo := a.GetRepository()
+	if repo != nil && repo.GetID() != 0 {
+		return fmt.Sprintf("%d:%d", repo.GetID(), a.GetNumber())
+	}
+	if a.GetHTMLURL() != "" {
+		return a.GetHTMLURL()
+	}
+	return fmt.Sprintf("unknown:%d", a.GetNumber())
 }
 
 func extractPURL(pkg spdxPackage) string {
@@ -1486,26 +1480,4 @@ func stringifyDBValue(v interface{}) string {
 	default:
 		return fmt.Sprintf("%v", x)
 	}
-}
-
-func formatGitHubAPIError(err error) string {
-	var ghErr *github.ErrorResponse
-	if !errors.As(err, &ghErr) {
-		return err.Error()
-	}
-	statusCode := 0
-	status := ""
-	url := ""
-	scopes := ""
-	acceptedScopes := ""
-	if ghErr.Response != nil {
-		statusCode = ghErr.Response.StatusCode
-		status = ghErr.Response.Status
-		scopes = ghErr.Response.Header.Get("X-OAuth-Scopes")
-		acceptedScopes = ghErr.Response.Header.Get("X-Accepted-OAuth-Scopes")
-		if ghErr.Response.Request != nil && ghErr.Response.Request.URL != nil {
-			url = ghErr.Response.Request.URL.String()
-		}
-	}
-	return fmt.Sprintf("status=%d (%s) url=%s message=%q oauth_scopes=%q accepted_scopes=%q", statusCode, status, url, ghErr.Message, scopes, acceptedScopes)
 }
