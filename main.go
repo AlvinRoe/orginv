@@ -895,7 +895,7 @@ func upsertRepo(db *sql.DB, org string, repo *github.Repository) error {
 			repo_id, allow_rebase_merge, allow_update_branch, allow_squash_merge, allow_merge_commit,
 			allow_auto_merge, allow_forking, delete_branch_on_merge, use_squash_pr_title_as_default, web_commit_signoff_required
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(repo_id) DO UPDATE SET
 			allow_rebase_merge = excluded.allow_rebase_merge,
 			allow_update_branch = excluded.allow_update_branch,
