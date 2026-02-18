@@ -1032,12 +1032,12 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 		}
 		pkgIDMap[pkg.GetSPDXID()] = depID
 		if _, err := tx.Exec(`
-			INSERT INTO repo_dependencies(repo_id, dependency_id, source, snapshot_at, scope)
-			VALUES (?, ?, ?, ?, ?, ?)
-			ON CONFLICT(repo_id, dependency_id, source) DO UPDATE SET
-				snapshot_at = excluded.snapshot_at,
-				scope = excluded.scope
-		`, repoID, depID, "sbom", time.Now().UTC().Format(time.RFC3339), pkg.GetSPDXID()); err != nil {
+				INSERT INTO repo_dependencies(repo_id, dependency_id, source, snapshot_at, scope)
+				VALUES (?, ?, ?, ?, ?)
+				ON CONFLICT(repo_id, dependency_id, source) DO UPDATE SET
+					snapshot_at = excluded.snapshot_at,
+					scope = excluded.scope
+			`, repoID, depID, "sbom", time.Now().UTC().Format(time.RFC3339), pkg.GetSPDXID()); err != nil {
 			return err
 		}
 
