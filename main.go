@@ -938,15 +938,18 @@ func fetchDependabotAlerts(ctx context.Context, client *github.Client, org strin
 	seen := make(map[string]struct{})
 	states := []string{"open", "dismissed", "fixed", "auto_dismissed"}
 	for _, state := range states {
-		page := 1
+		after := ""
 		for {
 			opts := &github.ListAlertsOptions{
-				State:       stringPtr(state),
-				ListOptions: github.ListOptions{PerPage: perPage, Page: page},
+				State: stringPtr(state),
+				ListCursorOptions: github.ListCursorOptions{
+					PerPage: perPage,
+					After:   after,
+				},
 			}
 			alerts, resp, err := client.Dependabot.ListOrgAlerts(ctx, org, opts)
 			if err != nil {
-				return nil, pageCount, fmt.Errorf("dependabot org alerts fetch failed (org=%s state=%s page=%d): %w", org, state, page, err)
+				return nil, pageCount, fmt.Errorf("dependabot org alerts fetch failed (org=%s state=%s after=%q): %w", org, state, after, err)
 			}
 			pageCount++
 			added := 0
@@ -962,11 +965,11 @@ func fetchDependabotAlerts(ctx context.Context, client *github.Client, org strin
 				all = append(all, alert)
 				added++
 			}
-			log.Printf("dependabot page fetched: state=%s page=%d items=%d added=%d total=%d", state, page, len(alerts), added, len(all))
-			if resp.NextPage == 0 {
+			log.Printf("dependabot page fetched: state=%s after=%q items=%d added=%d total=%d", state, after, len(alerts), added, len(all))
+			if resp.After == "" {
 				break
 			}
-			page = resp.NextPage
+			after = resp.After
 		}
 	}
 	return all, pageCount, nil
