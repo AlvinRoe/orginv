@@ -109,24 +109,6 @@ func main() {
 		log.Fatalf("failed to initialize sqlite schema: %v", err)
 	}
 
-	runUUID := fmt.Sprintf("run-%d", time.Now().UTC().UnixNano())
-	if err := startIngestionRun(db, runUUID); err != nil {
-		log.Fatalf("failed to create ingestion run: %v", err)
-	}
-
-	var runErr error
-	defer func() {
-		status := "success"
-		summary := ""
-		if runErr != nil {
-			status = "partial_success"
-			summary = runErr.Error()
-		}
-		if err := finishIngestionRun(db, runUUID, status, summary); err != nil {
-			log.Printf("failed to finalize ingestion run: %v", err)
-		}
-	}()
-
 	repos, err := fetchAllRepos(ctx, client, cfg.Org, cfg.ResultsPerPage)
 	if err != nil {
 		log.Fatalf("failed to fetch repositories: %v", err)
@@ -138,7 +120,7 @@ func main() {
 
 	for _, repo := range repos {
 		repoID := repo.GetID()
-		if err := upsertRepo(db, runUUID, cfg.Org, repo); err != nil {
+		if err := upsertRepo(db, cfg.Org, repo); err != nil {
 			log.Printf("failed to upsert repo %s: %v", repo.GetFullName(), err)
 			continue
 		}
@@ -185,7 +167,7 @@ func main() {
 					priority: 30,
 					rows:     len(alerts),
 					apply: func(execDB *sql.DB) error {
-						return ingestDependabotAlerts(execDB, runUUID, repoIDByName, alerts)
+						return ingestDependabotAlerts(execDB, repoIDByName, alerts)
 					},
 				})
 				return nil
@@ -204,7 +186,7 @@ func main() {
 					priority: 30,
 					rows:     len(alerts),
 					apply: func(execDB *sql.DB) error {
-						return ingestCodeScanningAlerts(execDB, runUUID, repoIDByName, alerts)
+						return ingestCodeScanningAlerts(execDB, repoIDByName, alerts)
 					},
 				})
 				return nil
@@ -223,7 +205,7 @@ func main() {
 					priority: 30,
 					rows:     len(alerts),
 					apply: func(execDB *sql.DB) error {
-						return ingestSecretScanningAlerts(execDB, runUUID, repoIDByName, alerts)
+						return ingestSecretScanningAlerts(execDB, repoIDByName, alerts)
 					},
 				})
 				return nil
@@ -245,7 +227,7 @@ func main() {
 	}
 	orgWG.Wait()
 
-	log.Printf("fetching per-repo datasets (sbom, rulesets)")
+	log.Printf("fetching per-repo datasets (sbom)")
 	const repoWorkers = 10
 	repoChan := make(chan *github.Repository, len(activeRepos))
 	var wg sync.WaitGroup
@@ -269,22 +251,7 @@ func main() {
 						priority: 10,
 						rows:     1,
 						apply: func(execDB *sql.DB) error {
-							return ingestSBOM(execDB, runUUID, repoID, sbom)
-						},
-					})
-				}
-
-				rulesets, pages, rErr := fetchRepoRulesets(ctx, client, cfg.Org, repoName, cfg.ResultsPerPage)
-				if rErr != nil {
-					recordErr(fmt.Sprintf("worker %d rulesets %s", workerID, repoName), rErr)
-				} else {
-					log.Printf("worker %d rulesets fetched for %s: pages=%d rulesets=%d", workerID, repoName, pages, len(rulesets))
-					enqueueWriteOp(dbWriteOp{
-						name:     fmt.Sprintf("rulesets %s", repoName),
-						priority: 20,
-						rows:     len(rulesets),
-						apply: func(execDB *sql.DB) error {
-							return ingestRepoRulesets(execDB, runUUID, repoID, rulesets)
+							return ingestSBOM(execDB, repoID, sbom)
 						},
 					})
 				}
@@ -316,13 +283,12 @@ func main() {
 		log.Printf("db queue %d/%d done: %s in %s", idx+1, len(writeOps), op.name, time.Since(started))
 	}
 
-	if err := exportCSVReport(db, runUUID, cfg.CSVOutputPath); err != nil {
-		runErr = fmt.Errorf("csv export failed: %w", err)
+	if err := exportCSVReport(db, cfg.CSVOutputPath); err != nil {
 		log.Fatalf("failed to export csv report: %v", err)
 	}
 
 	if len(errorsSeen) > 0 {
-		runErr = fmt.Errorf("completed with %d ingestion errors (see logs)", len(errorsSeen))
+		log.Printf("completed with %d ingestion errors (see logs)", len(errorsSeen))
 	}
 
 	log.Printf("phase 1 complete")
@@ -385,16 +351,8 @@ func initSQLite(db *sql.DB) error {
 	schema := []string{
 		`PRAGMA foreign_keys = ON;`,
 		`PRAGMA journal_mode = WAL;`,
-		`CREATE TABLE IF NOT EXISTS ingestion_runs (
-			run_uuid TEXT PRIMARY KEY,
-			started_at TEXT NOT NULL,
-			finished_at TEXT,
-			status TEXT,
-			error_summary TEXT
-		);`,
 		`CREATE TABLE IF NOT EXISTS repos (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
+			repo_id INTEGER PRIMARY KEY,
 			org_login TEXT NOT NULL,
 			name TEXT NOT NULL,
 			full_name TEXT NOT NULL,
@@ -423,10 +381,71 @@ func initSQLite(db *sql.DB) error {
 			secret_scanning_status TEXT,
 			secret_scanning_push_protection_status TEXT,
 			dependabot_security_updates_status TEXT,
-			created_at TEXT,
-			updated_at TEXT,
-			pushed_at TEXT,
-			PRIMARY KEY (run_uuid, repo_id)
+			node_id TEXT,
+			owner_login TEXT,
+			owner_id INTEGER,
+			owner_type TEXT,
+			owner_site_admin INTEGER,
+			html_url TEXT,
+			clone_url TEXT,
+			git_url TEXT,
+			mirror_url TEXT,
+			ssh_url TEXT,
+			svn_url TEXT,
+			network_count INTEGER,
+			subscribers_count INTEGER,
+			watchers_count INTEGER,
+			watchers INTEGER,
+			auto_init INTEGER,
+			allow_rebase_merge INTEGER,
+			allow_update_branch INTEGER,
+			allow_squash_merge INTEGER,
+			allow_merge_commit INTEGER,
+			allow_auto_merge INTEGER,
+			allow_forking INTEGER,
+			web_commit_signoff_required INTEGER,
+			delete_branch_on_merge INTEGER,
+			use_squash_pr_title_as_default INTEGER,
+			squash_merge_commit_title TEXT,
+			squash_merge_commit_message TEXT,
+			merge_commit_title TEXT,
+			merge_commit_message TEXT,
+			has_downloads INTEGER,
+			license_key TEXT,
+			license_name TEXT,
+			license_url TEXT,
+			license_node_id TEXT,
+			secret_scanning_validity_checks_status TEXT,
+			master_branch TEXT,
+			role_name TEXT,
+			parent_repo_id INTEGER,
+			source_repo_id INTEGER,
+			template_repo_id INTEGER,
+			organization_id INTEGER,
+			team_id INTEGER,
+			private_forks INTEGER,
+			custom_properties_json TEXT
+		);`,
+		`CREATE TABLE IF NOT EXISTS repo_owners (
+			repo_id INTEGER PRIMARY KEY,
+			owner_id INTEGER,
+			login TEXT,
+			node_id TEXT,
+			type TEXT,
+			site_admin INTEGER,
+			html_url TEXT
+		);`,
+		`CREATE TABLE IF NOT EXISTS repo_merge_policies (
+			repo_id INTEGER PRIMARY KEY,
+			allow_rebase_merge INTEGER,
+			allow_update_branch INTEGER,
+			allow_squash_merge INTEGER,
+			allow_merge_commit INTEGER,
+			allow_auto_merge INTEGER,
+			allow_forking INTEGER,
+			delete_branch_on_merge INTEGER,
+			use_squash_pr_title_as_default INTEGER,
+			web_commit_signoff_required INTEGER
 		);`,
 		`CREATE TABLE IF NOT EXISTS dependencies (
 			dependency_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -436,21 +455,23 @@ func initSQLite(db *sql.DB) error {
 			purl TEXT NOT NULL DEFAULT '',
 			license TEXT,
 			supplier TEXT,
+			license_declared TEXT,
+			download_location TEXT,
+			files_analyzed INTEGER,
 			UNIQUE (ecosystem, name, version, purl)
 		);`,
 		`CREATE TABLE IF NOT EXISTS repo_dependencies (
-			run_uuid TEXT NOT NULL,
 			repo_id INTEGER NOT NULL,
 			dependency_id INTEGER NOT NULL,
 			source TEXT NOT NULL,
 			snapshot_at TEXT NOT NULL,
-			PRIMARY KEY (run_uuid, repo_id, dependency_id, source),
+			scope TEXT,
+			PRIMARY KEY (repo_id, dependency_id, source),
 			FOREIGN KEY(dependency_id) REFERENCES dependencies(dependency_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS sbom_documents (
 			sbom_id INTEGER PRIMARY KEY AUTOINCREMENT,
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
+			repo_id INTEGER NOT NULL UNIQUE,
 			spdx_id TEXT,
 			spdx_version TEXT,
 			document_name TEXT,
@@ -460,22 +481,35 @@ func initSQLite(db *sql.DB) error {
 			creation_creators TEXT,
 			document_describes_count INTEGER,
 			package_count INTEGER,
-			relationship_count INTEGER,
-			UNIQUE (run_uuid, repo_id)
+			relationship_count INTEGER
+		);`,
+		`CREATE TABLE IF NOT EXISTS sbom_document_describes (
+			sbom_id INTEGER NOT NULL,
+			spdx_element_id TEXT NOT NULL,
+			PRIMARY KEY (sbom_id, spdx_element_id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS sbom_package_external_refs (
+			sbom_id INTEGER NOT NULL,
+			dependency_id INTEGER,
+			spdx_package_id TEXT,
+			reference_category TEXT,
+			reference_type TEXT,
+			reference_locator TEXT,
+			PRIMARY KEY (sbom_id, spdx_package_id, reference_category, reference_type, reference_locator)
 		);`,
 		`CREATE TABLE IF NOT EXISTS sbom_relationships (
-			run_uuid TEXT NOT NULL,
 			sbom_id INTEGER NOT NULL,
 			from_dependency_id INTEGER,
 			to_dependency_id INTEGER,
 			relationship_type TEXT NOT NULL,
-			PRIMARY KEY (run_uuid, sbom_id, from_dependency_id, to_dependency_id, relationship_type),
+			from_spdx_id TEXT,
+			to_spdx_id TEXT,
+			PRIMARY KEY (sbom_id, from_dependency_id, to_dependency_id, relationship_type),
 			FOREIGN KEY(sbom_id) REFERENCES sbom_documents(sbom_id),
 			FOREIGN KEY(from_dependency_id) REFERENCES dependencies(dependency_id),
 			FOREIGN KEY(to_dependency_id) REFERENCES dependencies(dependency_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS dependabot_alerts (
-			run_uuid TEXT NOT NULL,
 			repo_id INTEGER NOT NULL,
 			alert_number INTEGER NOT NULL,
 			state TEXT,
@@ -488,11 +522,71 @@ func initSQLite(db *sql.DB) error {
 			fixed_at TEXT,
 			dismissed_reason TEXT,
 			dependency_id INTEGER,
-			PRIMARY KEY (run_uuid, repo_id, alert_number),
+			url TEXT,
+			html_url TEXT,
+			dismissed_at TEXT,
+			dismissed_comment TEXT,
+			auto_dismissed_at TEXT,
+			dependency_scope TEXT,
+			advisory_ghsa_id TEXT,
+			advisory_cve_id TEXT,
+			PRIMARY KEY (repo_id, alert_number),
 			FOREIGN KEY(dependency_id) REFERENCES dependencies(dependency_id)
 		);`,
+		`CREATE TABLE IF NOT EXISTS dependabot_security_advisories (
+			repo_id INTEGER NOT NULL,
+			alert_number INTEGER NOT NULL,
+			ghsa_id TEXT,
+			cve_id TEXT,
+			summary TEXT,
+			description TEXT,
+			severity TEXT,
+			cvss_score REAL,
+			cvss_vector_string TEXT,
+			epss_percentage REAL,
+			epss_percentile REAL,
+			published_at TEXT,
+			updated_at TEXT,
+			withdrawn_at TEXT,
+			PRIMARY KEY (repo_id, alert_number)
+		);`,
+		`CREATE TABLE IF NOT EXISTS dependabot_advisory_vulnerabilities (
+			repo_id INTEGER NOT NULL,
+			alert_number INTEGER NOT NULL,
+			row_num INTEGER NOT NULL,
+			ecosystem TEXT,
+			package_name TEXT,
+			severity TEXT,
+			vulnerable_version_range TEXT,
+			first_patched_version TEXT,
+			patched_versions TEXT,
+			vulnerable_functions TEXT,
+			PRIMARY KEY (repo_id, alert_number, row_num)
+		);`,
+		`CREATE TABLE IF NOT EXISTS dependabot_advisory_identifiers (
+			repo_id INTEGER NOT NULL,
+			alert_number INTEGER NOT NULL,
+			row_num INTEGER NOT NULL,
+			value TEXT,
+			type TEXT,
+			PRIMARY KEY (repo_id, alert_number, row_num)
+		);`,
+		`CREATE TABLE IF NOT EXISTS dependabot_advisory_references (
+			repo_id INTEGER NOT NULL,
+			alert_number INTEGER NOT NULL,
+			row_num INTEGER NOT NULL,
+			url TEXT,
+			PRIMARY KEY (repo_id, alert_number, row_num)
+		);`,
+		`CREATE TABLE IF NOT EXISTS dependabot_advisory_cwes (
+			repo_id INTEGER NOT NULL,
+			alert_number INTEGER NOT NULL,
+			row_num INTEGER NOT NULL,
+			cwe_id TEXT,
+			name TEXT,
+			PRIMARY KEY (repo_id, alert_number, row_num)
+		);`,
 		`CREATE TABLE IF NOT EXISTS code_scanning_alerts (
-			run_uuid TEXT NOT NULL,
 			repo_id INTEGER NOT NULL,
 			alert_number INTEGER NOT NULL,
 			state TEXT,
@@ -512,10 +606,29 @@ func initSQLite(db *sql.DB) error {
 			most_recent_state TEXT,
 			most_recent_category TEXT,
 			most_recent_classifications TEXT,
-			PRIMARY KEY (run_uuid, repo_id, alert_number)
+			updated_at TEXT,
+			closed_at TEXT,
+			url TEXT,
+			html_url TEXT,
+			instances_url TEXT,
+			dismissed_at TEXT,
+			dismissed_reason TEXT,
+			dismissed_comment TEXT,
+			rule_description TEXT,
+			tool_guid TEXT,
+			tool_version TEXT,
+			most_recent_analysis_key TEXT,
+			most_recent_environment TEXT,
+			PRIMARY KEY (repo_id, alert_number)
+		);`,
+		`CREATE TABLE IF NOT EXISTS code_scanning_rule_tags (
+			repo_id INTEGER NOT NULL,
+			alert_number INTEGER NOT NULL,
+			row_num INTEGER NOT NULL,
+			tag TEXT,
+			PRIMARY KEY (repo_id, alert_number, row_num)
 		);`,
 		`CREATE TABLE IF NOT EXISTS secret_scanning_alerts (
-			run_uuid TEXT NOT NULL,
 			repo_id INTEGER NOT NULL,
 			alert_number INTEGER NOT NULL,
 			state TEXT,
@@ -524,206 +637,28 @@ func initSQLite(db *sql.DB) error {
 			created_at TEXT,
 			updated_at TEXT,
 			resolved_at TEXT,
-			PRIMARY KEY (run_uuid, repo_id, alert_number)
-		);`,
-		`CREATE TABLE IF NOT EXISTS repo_rulesets (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			ruleset_id INTEGER NOT NULL,
-			name TEXT,
-			enforcement TEXT,
-			target TEXT,
-			source TEXT,
-			source_type TEXT,
-			bypass_actor_count INTEGER,
-			current_user_can_bypass TEXT,
-			node_id TEXT,
-			created_at TEXT,
-			updated_at TEXT,
-			ref_name_includes TEXT,
-			ref_name_excludes TEXT,
-			PRIMARY KEY (run_uuid, repo_id, ruleset_id)
-		);`,
-		`CREATE TABLE IF NOT EXISTS repo_owners (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			owner_id INTEGER,
-			login TEXT,
-			node_id TEXT,
-			type TEXT,
-			site_admin INTEGER,
+			url TEXT,
 			html_url TEXT,
-			PRIMARY KEY (run_uuid, repo_id)
-		);`,
-		`CREATE TABLE IF NOT EXISTS repo_permissions (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			admin INTEGER,
-			maintain INTEGER,
-			push INTEGER,
-			triage INTEGER,
-			pull INTEGER,
-			PRIMARY KEY (run_uuid, repo_id)
-		);`,
-		`CREATE TABLE IF NOT EXISTS repo_urls (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			url TEXT,
-			archive_url TEXT,
-			assignees_url TEXT,
-			blobs_url TEXT,
-			branches_url TEXT,
-			collaborators_url TEXT,
-			comments_url TEXT,
-			commits_url TEXT,
-			compare_url TEXT,
-			contents_url TEXT,
-			contributors_url TEXT,
-			deployments_url TEXT,
-			downloads_url TEXT,
-			events_url TEXT,
-			forks_url TEXT,
-			git_commits_url TEXT,
-			git_refs_url TEXT,
-			git_tags_url TEXT,
-			hooks_url TEXT,
-			issue_comment_url TEXT,
-			issue_events_url TEXT,
-			issues_url TEXT,
-			keys_url TEXT,
-			labels_url TEXT,
-			languages_url TEXT,
-			merges_url TEXT,
-			milestones_url TEXT,
-			notifications_url TEXT,
-			pulls_url TEXT,
-			releases_url TEXT,
-			stargazers_url TEXT,
-			statuses_url TEXT,
-			subscribers_url TEXT,
-			subscription_url TEXT,
-			tags_url TEXT,
-			trees_url TEXT,
-			teams_url TEXT,
-			PRIMARY KEY (run_uuid, repo_id)
-		);`,
-		`CREATE TABLE IF NOT EXISTS repo_merge_policies (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			allow_rebase_merge INTEGER,
-			allow_update_branch INTEGER,
-			allow_squash_merge INTEGER,
-			allow_merge_commit INTEGER,
-			allow_auto_merge INTEGER,
-			allow_forking INTEGER,
-			delete_branch_on_merge INTEGER,
-			use_squash_pr_title_as_default INTEGER,
-			web_commit_signoff_required INTEGER,
-			PRIMARY KEY (run_uuid, repo_id)
-		);`,
-		`CREATE TABLE IF NOT EXISTS sbom_document_describes (
-			run_uuid TEXT NOT NULL,
-			sbom_id INTEGER NOT NULL,
-			spdx_element_id TEXT NOT NULL,
-			PRIMARY KEY (run_uuid, sbom_id, spdx_element_id)
-		);`,
-		`CREATE TABLE IF NOT EXISTS sbom_package_external_refs (
-			run_uuid TEXT NOT NULL,
-			sbom_id INTEGER NOT NULL,
-			dependency_id INTEGER,
-			spdx_package_id TEXT,
-			reference_category TEXT,
-			reference_type TEXT,
-			reference_locator TEXT,
-			PRIMARY KEY (run_uuid, sbom_id, spdx_package_id, reference_category, reference_type, reference_locator)
-		);`,
-		`CREATE TABLE IF NOT EXISTS dependabot_security_advisories (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			alert_number INTEGER NOT NULL,
-			ghsa_id TEXT,
-			cve_id TEXT,
-			summary TEXT,
-			description TEXT,
-			severity TEXT,
-			cvss_score REAL,
-			cvss_vector_string TEXT,
-			epss_percentage REAL,
-			epss_percentile REAL,
-			published_at TEXT,
-			updated_at TEXT,
-			withdrawn_at TEXT,
-			PRIMARY KEY (run_uuid, repo_id, alert_number)
-		);`,
-		`CREATE TABLE IF NOT EXISTS dependabot_advisory_vulnerabilities (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			alert_number INTEGER NOT NULL,
-			row_num INTEGER NOT NULL,
-			ecosystem TEXT,
-			package_name TEXT,
-			severity TEXT,
-			vulnerable_version_range TEXT,
-			first_patched_version TEXT,
-			patched_versions TEXT,
-			vulnerable_functions TEXT,
-			PRIMARY KEY (run_uuid, repo_id, alert_number, row_num)
-		);`,
-		`CREATE TABLE IF NOT EXISTS dependabot_advisory_identifiers (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			alert_number INTEGER NOT NULL,
-			row_num INTEGER NOT NULL,
-			value TEXT,
-			type TEXT,
-			PRIMARY KEY (run_uuid, repo_id, alert_number, row_num)
-		);`,
-		`CREATE TABLE IF NOT EXISTS dependabot_advisory_references (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			alert_number INTEGER NOT NULL,
-			row_num INTEGER NOT NULL,
-			url TEXT,
-			PRIMARY KEY (run_uuid, repo_id, alert_number, row_num)
-		);`,
-		`CREATE TABLE IF NOT EXISTS dependabot_advisory_cwes (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			alert_number INTEGER NOT NULL,
-			row_num INTEGER NOT NULL,
-			cwe_id TEXT,
-			name TEXT,
-			PRIMARY KEY (run_uuid, repo_id, alert_number, row_num)
-		);`,
-		`CREATE TABLE IF NOT EXISTS code_scanning_alert_instances (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			alert_number INTEGER NOT NULL,
-			row_num INTEGER NOT NULL,
-			ref TEXT,
-			analysis_key TEXT,
-			category TEXT,
-			environment TEXT,
-			state TEXT,
-			commit_sha TEXT,
-			message_text TEXT,
-			path TEXT,
-			start_line INTEGER,
-			end_line INTEGER,
-			start_column INTEGER,
-			end_column INTEGER,
-			PRIMARY KEY (run_uuid, repo_id, alert_number, row_num)
-		);`,
-		`CREATE TABLE IF NOT EXISTS code_scanning_rule_tags (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			alert_number INTEGER NOT NULL,
-			row_num INTEGER NOT NULL,
-			tag TEXT,
-			PRIMARY KEY (run_uuid, repo_id, alert_number, row_num)
+			locations_url TEXT,
+			secret_type_display_name TEXT,
+			secret TEXT,
+			is_base64_encoded INTEGER,
+			multi_repo INTEGER,
+			publicly_leaked INTEGER,
+			push_protection_bypassed INTEGER,
+			push_protection_bypassed_by_login TEXT,
+			push_protection_bypassed_by_id INTEGER,
+			push_protection_bypassed_at TEXT,
+			resolution_comment TEXT,
+			push_protection_bypass_request_comment TEXT,
+			push_protection_bypass_request_html_url TEXT,
+			push_protection_bypass_request_reviewer_login TEXT,
+			push_protection_bypass_request_reviewer_id INTEGER,
+			validity TEXT,
+			has_more_locations INTEGER,
+			PRIMARY KEY (repo_id, alert_number)
 		);`,
 		`CREATE TABLE IF NOT EXISTS secret_scanning_first_locations (
-			run_uuid TEXT NOT NULL,
 			repo_id INTEGER NOT NULL,
 			alert_number INTEGER NOT NULL,
 			path TEXT,
@@ -736,75 +671,7 @@ func initSQLite(db *sql.DB) error {
 			commit_sha TEXT,
 			commit_url TEXT,
 			pull_request_comment_url TEXT,
-			PRIMARY KEY (run_uuid, repo_id, alert_number)
-		);`,
-		`CREATE TABLE IF NOT EXISTS repo_ruleset_bypass_actors (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			ruleset_id INTEGER NOT NULL,
-			row_num INTEGER NOT NULL,
-			actor_id INTEGER,
-			actor_type TEXT,
-			bypass_mode TEXT,
-			PRIMARY KEY (run_uuid, repo_id, ruleset_id, row_num)
-		);`,
-		`CREATE TABLE IF NOT EXISTS repo_ruleset_links (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			ruleset_id INTEGER NOT NULL,
-			self_href TEXT,
-			html_href TEXT,
-			PRIMARY KEY (run_uuid, repo_id, ruleset_id)
-		);`,
-		`CREATE TABLE IF NOT EXISTS repo_ruleset_rule_entries (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			ruleset_id INTEGER NOT NULL,
-			row_num INTEGER NOT NULL,
-			rule_type TEXT,
-			parameters_json TEXT,
-			PRIMARY KEY (run_uuid, repo_id, ruleset_id, row_num)
-		);`,
-		`CREATE TABLE IF NOT EXISTS repo_ruleset_condition_repo_ids (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			ruleset_id INTEGER NOT NULL,
-			repository_id INTEGER NOT NULL,
-			PRIMARY KEY (run_uuid, repo_id, ruleset_id, repository_id)
-		);`,
-		`CREATE TABLE IF NOT EXISTS repo_ruleset_condition_repo_names (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			ruleset_id INTEGER NOT NULL,
-			include_exclude TEXT NOT NULL,
-			repo_name TEXT NOT NULL,
-			PRIMARY KEY (run_uuid, repo_id, ruleset_id, include_exclude, repo_name)
-		);`,
-		`CREATE TABLE IF NOT EXISTS repo_ruleset_condition_org_ids (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			ruleset_id INTEGER NOT NULL,
-			organization_id INTEGER NOT NULL,
-			PRIMARY KEY (run_uuid, repo_id, ruleset_id, organization_id)
-		);`,
-		`CREATE TABLE IF NOT EXISTS repo_ruleset_condition_org_names (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			ruleset_id INTEGER NOT NULL,
-			include_exclude TEXT NOT NULL,
-			organization_name TEXT NOT NULL,
-			PRIMARY KEY (run_uuid, repo_id, ruleset_id, include_exclude, organization_name)
-		);`,
-		`CREATE TABLE IF NOT EXISTS repo_ruleset_condition_property_targets (
-			run_uuid TEXT NOT NULL,
-			repo_id INTEGER NOT NULL,
-			ruleset_id INTEGER NOT NULL,
-			target_scope TEXT NOT NULL,
-			include_exclude TEXT NOT NULL,
-			name TEXT NOT NULL,
-			property_values TEXT,
-			source TEXT,
-			PRIMARY KEY (run_uuid, repo_id, ruleset_id, target_scope, include_exclude, name, property_values)
+			PRIMARY KEY (repo_id, alert_number)
 		);`,
 	}
 
@@ -813,179 +680,10 @@ func initSQLite(db *sql.DB) error {
 			return err
 		}
 	}
-	return applySchemaMigrations(db)
-}
-
-func applySchemaMigrations(db *sql.DB) error {
-	migrations := map[string][]schemaColumn{
-		"repos": {
-			{name: "description", definition: "TEXT"},
-			{name: "homepage", definition: "TEXT"},
-			{name: "topics", definition: "TEXT"},
-			{name: "size_kb", definition: "INTEGER"},
-			{name: "forks_count", definition: "INTEGER"},
-			{name: "stargazers_count", definition: "INTEGER"},
-			{name: "has_issues", definition: "INTEGER"},
-			{name: "has_projects", definition: "INTEGER"},
-			{name: "has_wiki", definition: "INTEGER"},
-			{name: "has_pages", definition: "INTEGER"},
-			{name: "has_discussions", definition: "INTEGER"},
-			{name: "is_fork", definition: "INTEGER"},
-			{name: "is_template", definition: "INTEGER"},
-			{name: "license_spdx_id", definition: "TEXT"},
-			{name: "advanced_security_status", definition: "TEXT"},
-			{name: "secret_scanning_status", definition: "TEXT"},
-			{name: "secret_scanning_push_protection_status", definition: "TEXT"},
-			{name: "dependabot_security_updates_status", definition: "TEXT"},
-			{name: "node_id", definition: "TEXT"},
-			{name: "owner_login", definition: "TEXT"},
-			{name: "owner_id", definition: "INTEGER"},
-			{name: "owner_type", definition: "TEXT"},
-			{name: "owner_site_admin", definition: "INTEGER"},
-			{name: "html_url", definition: "TEXT"},
-			{name: "clone_url", definition: "TEXT"},
-			{name: "git_url", definition: "TEXT"},
-			{name: "mirror_url", definition: "TEXT"},
-			{name: "ssh_url", definition: "TEXT"},
-			{name: "svn_url", definition: "TEXT"},
-			{name: "network_count", definition: "INTEGER"},
-			{name: "subscribers_count", definition: "INTEGER"},
-			{name: "watchers_count", definition: "INTEGER"},
-			{name: "watchers", definition: "INTEGER"},
-			{name: "auto_init", definition: "INTEGER"},
-			{name: "allow_rebase_merge", definition: "INTEGER"},
-			{name: "allow_update_branch", definition: "INTEGER"},
-			{name: "allow_squash_merge", definition: "INTEGER"},
-			{name: "allow_merge_commit", definition: "INTEGER"},
-			{name: "allow_auto_merge", definition: "INTEGER"},
-			{name: "allow_forking", definition: "INTEGER"},
-			{name: "web_commit_signoff_required", definition: "INTEGER"},
-			{name: "delete_branch_on_merge", definition: "INTEGER"},
-			{name: "use_squash_pr_title_as_default", definition: "INTEGER"},
-			{name: "squash_merge_commit_title", definition: "TEXT"},
-			{name: "squash_merge_commit_message", definition: "TEXT"},
-			{name: "merge_commit_title", definition: "TEXT"},
-			{name: "merge_commit_message", definition: "TEXT"},
-			{name: "has_downloads", definition: "INTEGER"},
-			{name: "license_key", definition: "TEXT"},
-			{name: "license_name", definition: "TEXT"},
-			{name: "license_url", definition: "TEXT"},
-			{name: "license_node_id", definition: "TEXT"},
-			{name: "secret_scanning_validity_checks_status", definition: "TEXT"},
-			{name: "master_branch", definition: "TEXT"},
-			{name: "role_name", definition: "TEXT"},
-			{name: "parent_repo_id", definition: "INTEGER"},
-			{name: "source_repo_id", definition: "INTEGER"},
-			{name: "template_repo_id", definition: "INTEGER"},
-			{name: "organization_id", definition: "INTEGER"},
-			{name: "team_id", definition: "INTEGER"},
-			{name: "private_forks", definition: "INTEGER"},
-			{name: "custom_properties_json", definition: "TEXT"},
-		},
-		"dependencies": {
-			{name: "license_declared", definition: "TEXT"},
-			{name: "download_location", definition: "TEXT"},
-			{name: "files_analyzed", definition: "INTEGER"},
-		},
-		"repo_dependencies": {
-			{name: "scope", definition: "TEXT"},
-		},
-		"sbom_documents": {
-			{name: "spdx_id", definition: "TEXT"},
-			{name: "document_name", definition: "TEXT"},
-			{name: "data_license", definition: "TEXT"},
-			{name: "document_namespace", definition: "TEXT"},
-			{name: "creation_creators", definition: "TEXT"},
-			{name: "document_describes_count", definition: "INTEGER"},
-			{name: "package_count", definition: "INTEGER"},
-			{name: "relationship_count", definition: "INTEGER"},
-		},
-		"sbom_relationships": {
-			{name: "from_spdx_id", definition: "TEXT"},
-			{name: "to_spdx_id", definition: "TEXT"},
-		},
-		"dependabot_alerts": {
-			{name: "url", definition: "TEXT"},
-			{name: "html_url", definition: "TEXT"},
-			{name: "dismissed_at", definition: "TEXT"},
-			{name: "dismissed_comment", definition: "TEXT"},
-			{name: "auto_dismissed_at", definition: "TEXT"},
-			{name: "dependency_scope", definition: "TEXT"},
-			{name: "advisory_ghsa_id", definition: "TEXT"},
-			{name: "advisory_cve_id", definition: "TEXT"},
-		},
-		"code_scanning_alerts": {
-			{name: "most_recent_ref", definition: "TEXT"},
-			{name: "most_recent_commit_sha", definition: "TEXT"},
-			{name: "most_recent_path", definition: "TEXT"},
-			{name: "most_recent_start_line", definition: "INTEGER"},
-			{name: "most_recent_end_line", definition: "INTEGER"},
-			{name: "most_recent_start_column", definition: "INTEGER"},
-			{name: "most_recent_end_column", definition: "INTEGER"},
-			{name: "most_recent_state", definition: "TEXT"},
-			{name: "most_recent_category", definition: "TEXT"},
-			{name: "most_recent_classifications", definition: "TEXT"},
-			{name: "updated_at", definition: "TEXT"},
-			{name: "closed_at", definition: "TEXT"},
-			{name: "url", definition: "TEXT"},
-			{name: "html_url", definition: "TEXT"},
-			{name: "instances_url", definition: "TEXT"},
-			{name: "dismissed_at", definition: "TEXT"},
-			{name: "dismissed_reason", definition: "TEXT"},
-			{name: "dismissed_comment", definition: "TEXT"},
-			{name: "rule_description", definition: "TEXT"},
-			{name: "tool_guid", definition: "TEXT"},
-			{name: "tool_version", definition: "TEXT"},
-			{name: "most_recent_analysis_key", definition: "TEXT"},
-			{name: "most_recent_environment", definition: "TEXT"},
-		},
-		"secret_scanning_alerts": {
-			{name: "url", definition: "TEXT"},
-			{name: "html_url", definition: "TEXT"},
-			{name: "locations_url", definition: "TEXT"},
-			{name: "secret_type_display_name", definition: "TEXT"},
-			{name: "secret", definition: "TEXT"},
-			{name: "is_base64_encoded", definition: "INTEGER"},
-			{name: "multi_repo", definition: "INTEGER"},
-			{name: "publicly_leaked", definition: "INTEGER"},
-			{name: "push_protection_bypassed", definition: "INTEGER"},
-			{name: "push_protection_bypassed_by_login", definition: "TEXT"},
-			{name: "push_protection_bypassed_by_id", definition: "INTEGER"},
-			{name: "push_protection_bypassed_at", definition: "TEXT"},
-			{name: "resolution_comment", definition: "TEXT"},
-			{name: "push_protection_bypass_request_comment", definition: "TEXT"},
-			{name: "push_protection_bypass_request_html_url", definition: "TEXT"},
-			{name: "push_protection_bypass_request_reviewer_login", definition: "TEXT"},
-			{name: "push_protection_bypass_request_reviewer_id", definition: "INTEGER"},
-			{name: "validity", definition: "TEXT"},
-			{name: "has_more_locations", definition: "INTEGER"},
-		},
-		"repo_rulesets": {
-			{name: "name", definition: "TEXT"},
-			{name: "source", definition: "TEXT"},
-			{name: "source_type", definition: "TEXT"},
-			{name: "bypass_actor_count", definition: "INTEGER"},
-			{name: "current_user_can_bypass", definition: "TEXT"},
-			{name: "node_id", definition: "TEXT"},
-			{name: "created_at", definition: "TEXT"},
-			{name: "updated_at", definition: "TEXT"},
-			{name: "ref_name_includes", definition: "TEXT"},
-			{name: "ref_name_excludes", definition: "TEXT"},
-			{name: "rules_count", definition: "INTEGER"},
-			{name: "conditions_json", definition: "TEXT"},
-			{name: "rules_json", definition: "TEXT"},
-			{name: "links_self_href", definition: "TEXT"},
-			{name: "links_html_href", definition: "TEXT"},
-		},
-	}
-
-	for table, cols := range migrations {
-		if err := ensureColumns(db, table, cols); err != nil {
-			return err
-		}
-	}
 	return nil
 }
+
+func applySchemaMigrations(db *sql.DB) error { return nil }
 
 func ensureColumns(db *sql.DB, table string, cols []schemaColumn) error {
 	existing, err := tableColumns(db, table)
@@ -1030,17 +728,7 @@ func tableColumns(db *sql.DB, table string) (map[string]struct{}, error) {
 	return cols, nil
 }
 
-func startIngestionRun(db *sql.DB, runUUID string) error {
-	_, err := db.Exec(`INSERT INTO ingestion_runs(run_uuid, started_at, status) VALUES (?, ?, ?)`, runUUID, time.Now().UTC().Format(time.RFC3339), "running")
-	return err
-}
-
-func finishIngestionRun(db *sql.DB, runUUID, status, summary string) error {
-	_, err := db.Exec(`UPDATE ingestion_runs SET finished_at = ?, status = ?, error_summary = ? WHERE run_uuid = ?`, time.Now().UTC().Format(time.RFC3339), status, summary, runUUID)
-	return err
-}
-
-func upsertRepo(db *sql.DB, runUUID, org string, repo *github.Repository) error {
+func upsertRepo(db *sql.DB, org string, repo *github.Repository) error {
 	topics := strings.Join(repo.Topics, ",")
 	licenseSPDX := ""
 	licenseKey := ""
@@ -1079,14 +767,14 @@ func upsertRepo(db *sql.DB, runUUID, org string, repo *github.Repository) error 
 
 	_, err := db.Exec(`
 		INSERT INTO repos(
-			run_uuid, repo_id, org_login, name, full_name, visibility, private, archived, disabled,
+			repo_id, org_login, name, full_name, visibility, private, archived, disabled,
 			default_branch, language, open_issues_count, description, homepage, topics,
 			size_kb, forks_count, stargazers_count, has_issues, has_projects, has_wiki, has_pages,
 			has_discussions, is_fork, is_template, license_spdx_id, advanced_security_status,
 			secret_scanning_status, secret_scanning_push_protection_status, dependabot_security_updates_status,
 			created_at, updated_at, pushed_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(run_uuid, repo_id) DO UPDATE SET
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(repo_id) DO UPDATE SET
 			org_login = excluded.org_login,
 			name = excluded.name,
 			full_name = excluded.full_name,
@@ -1119,7 +807,6 @@ func upsertRepo(db *sql.DB, runUUID, org string, repo *github.Repository) error 
 			updated_at = excluded.updated_at,
 			pushed_at = excluded.pushed_at
 	`,
-		runUUID,
 		repo.GetID(),
 		org,
 		repo.GetName(),
@@ -1173,7 +860,7 @@ func upsertRepo(db *sql.DB, runUUID, org string, repo *github.Repository) error 
 			secret_scanning_validity_checks_status = ?, master_branch = ?, role_name = ?,
 			parent_repo_id = ?, source_repo_id = ?, template_repo_id = ?, organization_id = ?, team_id = ?,
 			private_forks = ?, custom_properties_json = ?
-		WHERE run_uuid = ? AND repo_id = ?
+		WHERE repo_id = ?
 	`,
 		repo.GetNodeID(), repo.GetOwner().GetLogin(), nullableInt64Value(repo.GetOwner().GetID()), repo.GetOwner().GetType(), boolToInt(repo.GetOwner().GetSiteAdmin()),
 		repo.GetHTMLURL(), repo.GetCloneURL(), repo.GetGitURL(), repo.GetMirrorURL(), repo.GetSSHURL(), repo.GetSVNURL(),
@@ -1186,16 +873,16 @@ func upsertRepo(db *sql.DB, runUUID, org string, repo *github.Repository) error 
 		secretScanningValidityChecksStatus, repo.GetMasterBranch(), repo.GetRoleName(),
 		nullableInt64Value(repo.GetParent().GetID()), nullableInt64Value(repo.GetSource().GetID()), nullableInt64Value(repo.GetTemplateRepository().GetID()), nullableInt64Value(repo.GetOrganization().GetID()), nullableInt64Value(repo.GetTeamID()),
 		nil, customPropertiesJSON,
-		runUUID, repo.GetID(),
+		repo.GetID(),
 	)
 	if err != nil {
 		return err
 	}
 
 	if _, err = db.Exec(`
-		INSERT INTO repo_owners(run_uuid, repo_id, owner_id, login, node_id, type, site_admin, html_url)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(run_uuid, repo_id) DO UPDATE SET
+		INSERT INTO repo_owners(repo_id, owner_id, login, node_id, type, site_admin, html_url)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(repo_id) DO UPDATE SET
 			owner_id = excluded.owner_id,
 			login = excluded.login,
 			node_id = excluded.node_id,
@@ -1203,92 +890,18 @@ func upsertRepo(db *sql.DB, runUUID, org string, repo *github.Repository) error 
 			site_admin = excluded.site_admin,
 			html_url = excluded.html_url
 	`,
-		runUUID, repo.GetID(), nullableInt64Value(repo.GetOwner().GetID()), repo.GetOwner().GetLogin(), repo.GetOwner().GetNodeID(), repo.GetOwner().GetType(), boolToInt(repo.GetOwner().GetSiteAdmin()), repo.GetOwner().GetHTMLURL(),
-	); err != nil {
-		return err
-	}
-
-	if _, err = db.Exec(`
-		INSERT INTO repo_permissions(run_uuid, repo_id, admin, maintain, push, triage, pull)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(run_uuid, repo_id) DO UPDATE SET
-			admin = excluded.admin,
-			maintain = excluded.maintain,
-			push = excluded.push,
-			triage = excluded.triage,
-			pull = excluded.pull
-	`,
-		runUUID, repo.GetID(), boolToInt(repo.GetPermissions().GetAdmin()), boolToInt(repo.GetPermissions().GetMaintain()), boolToInt(repo.GetPermissions().GetPush()), boolToInt(repo.GetPermissions().GetTriage()), boolToInt(repo.GetPermissions().GetPull()),
-	); err != nil {
-		return err
-	}
-
-	if _, err = db.Exec(`
-		INSERT INTO repo_urls(
-			run_uuid, repo_id, url, archive_url, assignees_url, blobs_url, branches_url, collaborators_url,
-			comments_url, commits_url, compare_url, contents_url, contributors_url, deployments_url,
-			downloads_url, events_url, forks_url, git_commits_url, git_refs_url, git_tags_url, hooks_url,
-			issue_comment_url, issue_events_url, issues_url, keys_url, labels_url, languages_url, merges_url,
-			milestones_url, notifications_url, pulls_url, releases_url, stargazers_url, statuses_url,
-			subscribers_url, subscription_url, tags_url, trees_url, teams_url
-		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(run_uuid, repo_id) DO UPDATE SET
-			url = excluded.url,
-			archive_url = excluded.archive_url,
-			assignees_url = excluded.assignees_url,
-			blobs_url = excluded.blobs_url,
-			branches_url = excluded.branches_url,
-			collaborators_url = excluded.collaborators_url,
-			comments_url = excluded.comments_url,
-			commits_url = excluded.commits_url,
-			compare_url = excluded.compare_url,
-			contents_url = excluded.contents_url,
-			contributors_url = excluded.contributors_url,
-			deployments_url = excluded.deployments_url,
-			downloads_url = excluded.downloads_url,
-			events_url = excluded.events_url,
-			forks_url = excluded.forks_url,
-			git_commits_url = excluded.git_commits_url,
-			git_refs_url = excluded.git_refs_url,
-			git_tags_url = excluded.git_tags_url,
-			hooks_url = excluded.hooks_url,
-			issue_comment_url = excluded.issue_comment_url,
-			issue_events_url = excluded.issue_events_url,
-			issues_url = excluded.issues_url,
-			keys_url = excluded.keys_url,
-			labels_url = excluded.labels_url,
-			languages_url = excluded.languages_url,
-			merges_url = excluded.merges_url,
-			milestones_url = excluded.milestones_url,
-			notifications_url = excluded.notifications_url,
-			pulls_url = excluded.pulls_url,
-			releases_url = excluded.releases_url,
-			stargazers_url = excluded.stargazers_url,
-			statuses_url = excluded.statuses_url,
-			subscribers_url = excluded.subscribers_url,
-			subscription_url = excluded.subscription_url,
-			tags_url = excluded.tags_url,
-			trees_url = excluded.trees_url,
-			teams_url = excluded.teams_url
-	`,
-		runUUID, repo.GetID(), repo.GetURL(), repo.GetArchiveURL(), repo.GetAssigneesURL(), repo.GetBlobsURL(), repo.GetBranchesURL(), repo.GetCollaboratorsURL(),
-		repo.GetCommentsURL(), repo.GetCommitsURL(), repo.GetCompareURL(), repo.GetContentsURL(), repo.GetContributorsURL(), repo.GetDeploymentsURL(),
-		repo.GetDownloadsURL(), repo.GetEventsURL(), repo.GetForksURL(), repo.GetGitCommitsURL(), repo.GetGitRefsURL(), repo.GetGitTagsURL(), repo.GetHooksURL(),
-		repo.GetIssueCommentURL(), repo.GetIssueEventsURL(), repo.GetIssuesURL(), repo.GetKeysURL(), repo.GetLabelsURL(), repo.GetLanguagesURL(), repo.GetMergesURL(),
-		repo.GetMilestonesURL(), repo.GetNotificationsURL(), repo.GetPullsURL(), repo.GetReleasesURL(), repo.GetStargazersURL(), repo.GetStatusesURL(),
-		repo.GetSubscribersURL(), repo.GetSubscriptionURL(), repo.GetTagsURL(), repo.GetTreesURL(), repo.GetTeamsURL(),
+		repo.GetID(), nullableInt64Value(repo.GetOwner().GetID()), repo.GetOwner().GetLogin(), repo.GetOwner().GetNodeID(), repo.GetOwner().GetType(), boolToInt(repo.GetOwner().GetSiteAdmin()), repo.GetOwner().GetHTMLURL(),
 	); err != nil {
 		return err
 	}
 
 	_, err = db.Exec(`
 		INSERT INTO repo_merge_policies(
-			run_uuid, repo_id, allow_rebase_merge, allow_update_branch, allow_squash_merge, allow_merge_commit,
+			repo_id, allow_rebase_merge, allow_update_branch, allow_squash_merge, allow_merge_commit,
 			allow_auto_merge, allow_forking, delete_branch_on_merge, use_squash_pr_title_as_default, web_commit_signoff_required
 		)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(run_uuid, repo_id) DO UPDATE SET
+		ON CONFLICT(repo_id) DO UPDATE SET
 			allow_rebase_merge = excluded.allow_rebase_merge,
 			allow_update_branch = excluded.allow_update_branch,
 			allow_squash_merge = excluded.allow_squash_merge,
@@ -1299,7 +912,7 @@ func upsertRepo(db *sql.DB, runUUID, org string, repo *github.Repository) error 
 			use_squash_pr_title_as_default = excluded.use_squash_pr_title_as_default,
 			web_commit_signoff_required = excluded.web_commit_signoff_required
 	`,
-		runUUID, repo.GetID(), boolToInt(repo.GetAllowRebaseMerge()), boolToInt(repo.GetAllowUpdateBranch()), boolToInt(repo.GetAllowSquashMerge()),
+		repo.GetID(), boolToInt(repo.GetAllowRebaseMerge()), boolToInt(repo.GetAllowUpdateBranch()), boolToInt(repo.GetAllowSquashMerge()),
 		boolToInt(repo.GetAllowMergeCommit()), boolToInt(repo.GetAllowAutoMerge()), boolToInt(repo.GetAllowForking()),
 		boolToInt(repo.GetDeleteBranchOnMerge()), boolToInt(repo.GetUseSquashPRTitleAsDefault()), boolToInt(repo.GetWebCommitSignoffRequired()),
 	)
@@ -1346,7 +959,7 @@ func fetchAllRepos(ctx context.Context, client *github.Client, org string, perPa
 	return allRepos, nil
 }
 
-func ingestSBOM(db *sql.DB, runUUID string, repoID int64, sbom *github.SBOM) error {
+func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 	if sbom == nil || sbom.SBOM == nil {
 		return nil
 	}
@@ -1360,11 +973,11 @@ func ingestSBOM(db *sql.DB, runUUID string, repoID int64, sbom *github.SBOM) err
 
 	_, err = tx.Exec(`
 		INSERT INTO sbom_documents(
-			run_uuid, repo_id, spdx_id, spdx_version, document_name, data_license,
+			repo_id, spdx_id, spdx_version, document_name, data_license,
 			document_namespace, generated_at, creation_creators, document_describes_count, package_count, relationship_count
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(run_uuid, repo_id) DO UPDATE SET
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(repo_id) DO UPDATE SET
 			spdx_id = excluded.spdx_id,
 			spdx_version = excluded.spdx_version,
 			document_name = excluded.document_name,
@@ -1376,7 +989,6 @@ func ingestSBOM(db *sql.DB, runUUID string, repoID int64, sbom *github.SBOM) err
 			package_count = excluded.package_count,
 			relationship_count = excluded.relationship_count
 	`,
-		runUUID,
 		repoID,
 		doc.GetSPDXID(),
 		doc.GetSPDXVersion(),
@@ -1394,7 +1006,7 @@ func ingestSBOM(db *sql.DB, runUUID string, repoID int64, sbom *github.SBOM) err
 	}
 
 	var sbomID int64
-	if err := tx.QueryRow(`SELECT sbom_id FROM sbom_documents WHERE run_uuid = ? AND repo_id = ?`, runUUID, repoID).Scan(&sbomID); err != nil {
+	if err := tx.QueryRow(`SELECT sbom_id FROM sbom_documents WHERE repo_id = ?`, repoID).Scan(&sbomID); err != nil {
 		return err
 	}
 
@@ -1425,12 +1037,12 @@ func ingestSBOM(db *sql.DB, runUUID string, repoID int64, sbom *github.SBOM) err
 		}
 		pkgIDMap[pkg.GetSPDXID()] = depID
 		if _, err := tx.Exec(`
-			INSERT INTO repo_dependencies(run_uuid, repo_id, dependency_id, source, snapshot_at, scope)
+			INSERT INTO repo_dependencies(repo_id, dependency_id, source, snapshot_at, scope)
 			VALUES (?, ?, ?, ?, ?, ?)
-			ON CONFLICT(run_uuid, repo_id, dependency_id, source) DO UPDATE SET
+			ON CONFLICT(repo_id, dependency_id, source) DO UPDATE SET
 				snapshot_at = excluded.snapshot_at,
 				scope = excluded.scope
-		`, runUUID, repoID, depID, "sbom", time.Now().UTC().Format(time.RFC3339), pkg.GetSPDXID()); err != nil {
+		`, repoID, depID, "sbom", time.Now().UTC().Format(time.RFC3339), pkg.GetSPDXID()); err != nil {
 			return err
 		}
 
@@ -1439,10 +1051,10 @@ func ingestSBOM(db *sql.DB, runUUID string, repoID int64, sbom *github.SBOM) err
 				continue
 			}
 			_, err := tx.Exec(`
-				INSERT OR IGNORE INTO sbom_package_external_refs(
-					run_uuid, sbom_id, dependency_id, spdx_package_id, reference_category, reference_type, reference_locator
-				) VALUES (?, ?, ?, ?, ?, ?, ?)
-			`, runUUID, sbomID, depID, pkg.GetSPDXID(), ref.ReferenceCategory, ref.ReferenceType, ref.ReferenceLocator)
+					INSERT OR IGNORE INTO sbom_package_external_refs(
+						sbom_id, dependency_id, spdx_package_id, reference_category, reference_type, reference_locator
+					) VALUES (?, ?, ?, ?, ?, ?)
+				`, sbomID, depID, pkg.GetSPDXID(), ref.ReferenceCategory, ref.ReferenceType, ref.ReferenceLocator)
 			if err != nil {
 				return err
 			}
@@ -1454,9 +1066,9 @@ func ingestSBOM(db *sql.DB, runUUID string, repoID int64, sbom *github.SBOM) err
 			continue
 		}
 		if _, err := tx.Exec(`
-			INSERT OR IGNORE INTO sbom_document_describes(run_uuid, sbom_id, spdx_element_id)
-			VALUES (?, ?, ?)
-		`, runUUID, sbomID, described); err != nil {
+			INSERT OR IGNORE INTO sbom_document_describes(sbom_id, spdx_element_id)
+			VALUES (?, ?)
+		`, sbomID, described); err != nil {
 			return err
 		}
 	}
@@ -1472,10 +1084,10 @@ func ingestSBOM(db *sql.DB, runUUID string, repoID int64, sbom *github.SBOM) err
 		}
 		_, err := tx.Exec(`
 			INSERT OR IGNORE INTO sbom_relationships(
-				run_uuid, sbom_id, from_dependency_id, to_dependency_id, relationship_type, from_spdx_id, to_spdx_id
+				sbom_id, from_dependency_id, to_dependency_id, relationship_type, from_spdx_id, to_spdx_id
 			)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
-		`, runUUID, sbomID, nullableInt64(okFrom, fromID), nullableInt64(okTo, toID), rel.RelationshipType, rel.SPDXElementID, rel.RelatedSPDXElement)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, sbomID, nullableInt64(okFrom, fromID), nullableInt64(okTo, toID), rel.RelationshipType, rel.SPDXElementID, rel.RelatedSPDXElement)
 		if err != nil {
 			return err
 		}
@@ -1563,7 +1175,7 @@ func fetchDependabotAlerts(ctx context.Context, client *github.Client, org strin
 	return all, pageCount, nil
 }
 
-func ingestDependabotAlerts(db *sql.DB, runUUID string, repoIDByName map[string]int64, alerts []*github.DependabotAlert) error {
+func ingestDependabotAlerts(db *sql.DB, repoIDByName map[string]int64, alerts []*github.DependabotAlert) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -1572,11 +1184,11 @@ func ingestDependabotAlerts(db *sql.DB, runUUID string, repoIDByName map[string]
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO dependabot_alerts(
-			run_uuid, repo_id, alert_number, state, severity, ecosystem, package_name,
+			repo_id, alert_number, state, severity, ecosystem, package_name,
 			manifest_path, created_at, updated_at, fixed_at, dismissed_reason, dependency_id,
 			url, html_url, dismissed_at, dismissed_comment, auto_dismissed_at, dependency_scope, advisory_ghsa_id, advisory_cve_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(run_uuid, repo_id, alert_number) DO UPDATE SET
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(repo_id, alert_number) DO UPDATE SET
 			state = excluded.state,
 			severity = excluded.severity,
 			ecosystem = excluded.ecosystem,
@@ -1628,7 +1240,6 @@ func ingestDependabotAlerts(db *sql.DB, runUUID string, repoIDByName map[string]
 		}
 
 		_, err := stmt.Exec(
-			runUUID,
 			repoID,
 			a.GetNumber(),
 			a.GetState(),
@@ -1653,7 +1264,7 @@ func ingestDependabotAlerts(db *sql.DB, runUUID string, repoIDByName map[string]
 		if err != nil {
 			return err
 		}
-		if err := upsertDependabotAdvisoryTx(tx, runUUID, repoID, a); err != nil {
+		if err := upsertDependabotAdvisoryTx(tx, repoID, a); err != nil {
 			return err
 		}
 		inserted++
@@ -1703,7 +1314,7 @@ func fetchCodeScanningAlerts(ctx context.Context, client *github.Client, org str
 	return all, pageCount, nil
 }
 
-func ingestCodeScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[string]int64, alerts []*github.Alert) error {
+func ingestCodeScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts []*github.Alert) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -1712,14 +1323,14 @@ func ingestCodeScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[strin
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO code_scanning_alerts(
-			run_uuid, repo_id, alert_number, state, rule_id, tool, severity,
+			repo_id, alert_number, state, rule_id, tool, severity,
 			security_severity, created_at, fixed_at, most_recent_ref, most_recent_commit_sha,
 			most_recent_path, most_recent_start_line, most_recent_end_line, most_recent_start_column,
 			most_recent_end_column, most_recent_state, most_recent_category, most_recent_classifications,
 			updated_at, closed_at, url, html_url, instances_url, dismissed_at, dismissed_reason, dismissed_comment,
 			rule_description, tool_guid, tool_version, most_recent_analysis_key, most_recent_environment
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(run_uuid, repo_id, alert_number) DO UPDATE SET
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(repo_id, alert_number) DO UPDATE SET
 			state = excluded.state,
 			rule_id = excluded.rule_id,
 			tool = excluded.tool,
@@ -1785,7 +1396,6 @@ func ingestCodeScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[strin
 		}
 		instance := snapshotCodeScanningInstance(a.GetMostRecentInstance())
 		_, err := stmt.Exec(
-			runUUID,
 			repoID,
 			a.GetNumber(),
 			a.GetState(),
@@ -1822,10 +1432,7 @@ func ingestCodeScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[strin
 		if err != nil {
 			return err
 		}
-		if err := upsertCodeScanningRuleTagsTx(tx, runUUID, repoID, a); err != nil {
-			return err
-		}
-		if err := upsertCodeScanningInstancesTx(tx, runUUID, repoID, a); err != nil {
+		if err := upsertCodeScanningRuleTagsTx(tx, repoID, a); err != nil {
 			return err
 		}
 		inserted++
@@ -1875,7 +1482,7 @@ func fetchSecretScanningAlerts(ctx context.Context, client *github.Client, org s
 	return all, pageCount, nil
 }
 
-func ingestSecretScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[string]int64, alerts []*github.SecretScanningAlert) error {
+func ingestSecretScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts []*github.SecretScanningAlert) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -1884,14 +1491,14 @@ func ingestSecretScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[str
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO secret_scanning_alerts(
-			run_uuid, repo_id, alert_number, state, secret_type, resolution, created_at, updated_at, resolved_at,
+			repo_id, alert_number, state, secret_type, resolution, created_at, updated_at, resolved_at,
 			url, html_url, locations_url, secret_type_display_name, secret, is_base64_encoded, multi_repo, publicly_leaked,
 			push_protection_bypassed, push_protection_bypassed_by_login, push_protection_bypassed_by_id,
 			push_protection_bypassed_at, resolution_comment, push_protection_bypass_request_comment,
 			push_protection_bypass_request_html_url, push_protection_bypass_request_reviewer_login,
 			push_protection_bypass_request_reviewer_id, validity, has_more_locations
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(run_uuid, repo_id, alert_number) DO UPDATE SET
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(repo_id, alert_number) DO UPDATE SET
 			state = excluded.state,
 			secret_type = excluded.secret_type,
 			resolution = excluded.resolution,
@@ -1935,7 +1542,6 @@ func ingestSecretScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[str
 			continue
 		}
 		_, err := stmt.Exec(
-			runUUID,
 			repoID,
 			a.GetNumber(),
 			a.GetState(),
@@ -1967,7 +1573,7 @@ func ingestSecretScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[str
 		if err != nil {
 			return err
 		}
-		if err := upsertSecretScanningFirstLocationTx(tx, runUUID, repoID, a); err != nil {
+		if err := upsertSecretScanningFirstLocationTx(tx, repoID, a); err != nil {
 			return err
 		}
 		inserted++
@@ -1977,140 +1583,7 @@ func ingestSecretScanningAlerts(db *sql.DB, runUUID string, repoIDByName map[str
 	return tx.Commit()
 }
 
-func fetchRepoRulesets(ctx context.Context, client *github.Client, owner, repo string, perPage int) ([]*github.RepositoryRuleset, int, error) {
-	all := make([]*github.RepositoryRuleset, 0)
-	page := 1
-	pageCount := 0
-	includeParents := true
-	for {
-		opts := &github.RepositoryListRulesetsOptions{
-			IncludesParents: &includeParents,
-			ListOptions:     github.ListOptions{PerPage: perPage, Page: page},
-		}
-		rulesets, resp, err := client.Repositories.GetAllRulesets(ctx, owner, repo, opts)
-		if err != nil {
-			return nil, pageCount, err
-		}
-		pageCount++
-		all = append(all, rulesets...)
-		if resp.NextPage == 0 {
-			break
-		}
-		page = resp.NextPage
-	}
-	return all, pageCount, nil
-}
-
-func ingestRepoRulesets(db *sql.DB, runUUID string, repoID int64, rulesets []*github.RepositoryRuleset) error {
-	if len(rulesets) == 0 {
-		return nil
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.Prepare(`
-		INSERT INTO repo_rulesets(
-			run_uuid, repo_id, ruleset_id, name, enforcement, target, source, source_type,
-			bypass_actor_count, current_user_can_bypass, node_id, created_at, updated_at, ref_name_includes, ref_name_excludes,
-			rules_count, conditions_json, rules_json, links_self_href, links_html_href
-		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(run_uuid, repo_id, ruleset_id) DO UPDATE SET
-			name = excluded.name,
-			enforcement = excluded.enforcement,
-			target = excluded.target,
-			source = excluded.source,
-			source_type = excluded.source_type,
-			bypass_actor_count = excluded.bypass_actor_count,
-			current_user_can_bypass = excluded.current_user_can_bypass,
-			node_id = excluded.node_id,
-			created_at = excluded.created_at,
-			updated_at = excluded.updated_at,
-			ref_name_includes = excluded.ref_name_includes,
-			ref_name_excludes = excluded.ref_name_excludes,
-			rules_count = excluded.rules_count,
-			conditions_json = excluded.conditions_json,
-			rules_json = excluded.rules_json,
-			links_self_href = excluded.links_self_href,
-			links_html_href = excluded.links_html_href
-	`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-
-	for _, rs := range rulesets {
-		if rs == nil {
-			continue
-		}
-		enforcement := string(rs.Enforcement)
-		target := ""
-		if t := rs.GetTarget(); t != nil {
-			target = string(*t)
-		}
-		sourceType := ""
-		if st := rs.SourceType; st != nil {
-			sourceType = string(*st)
-		}
-		refNameIncludes := ""
-		refNameExcludes := ""
-		if rs.Conditions != nil && rs.Conditions.RefName != nil {
-			refNameIncludes = strings.Join(rs.Conditions.RefName.Include, ",")
-			refNameExcludes = strings.Join(rs.Conditions.RefName.Exclude, ",")
-		}
-		currentUserCanBypass := ""
-		if rs.CurrentUserCanBypass != nil {
-			currentUserCanBypass = string(*rs.CurrentUserCanBypass)
-		}
-		conditionsJSON := jsonString(rs.Conditions)
-		rulesJSON := jsonString(rs.Rules)
-		linksSelf := ""
-		linksHTML := ""
-		if rs.Links != nil {
-			if rs.Links.Self != nil {
-				linksSelf = rs.Links.Self.GetHRef()
-			}
-			if rs.Links.HTML != nil {
-				linksHTML = rs.Links.HTML.GetHRef()
-			}
-		}
-		_, err = stmt.Exec(
-			runUUID,
-			repoID,
-			rs.GetID(),
-			rs.Name,
-			enforcement,
-			target,
-			rs.Source,
-			sourceType,
-			len(rs.BypassActors),
-			currentUserCanBypass,
-			rs.GetNodeID(),
-			formatGitHubTimePtr(rs.CreatedAt),
-			formatGitHubTimePtr(rs.UpdatedAt),
-			refNameIncludes,
-			refNameExcludes,
-			countRulesetRules(rs.Rules),
-			conditionsJSON,
-			rulesJSON,
-			linksSelf,
-			linksHTML,
-		)
-		if err != nil {
-			return err
-		}
-		if err := upsertRulesetChildrenTx(tx, runUUID, repoID, rs); err != nil {
-			return err
-		}
-	}
-
-	return tx.Commit()
-}
-
-func upsertDependabotAdvisoryTx(tx *sql.Tx, runUUID string, repoID int64, a *github.DependabotAlert) error {
+func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAlert) error {
 	if a == nil {
 		return nil
 	}
@@ -2119,10 +1592,10 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, runUUID string, repoID int64, a *git
 
 	_, err := tx.Exec(`
 		INSERT INTO dependabot_security_advisories(
-			run_uuid, repo_id, alert_number, ghsa_id, cve_id, summary, description, severity,
+			repo_id, alert_number, ghsa_id, cve_id, summary, description, severity,
 			cvss_score, cvss_vector_string, epss_percentage, epss_percentile, published_at, updated_at, withdrawn_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(run_uuid, repo_id, alert_number) DO UPDATE SET
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(repo_id, alert_number) DO UPDATE SET
 			ghsa_id = excluded.ghsa_id,
 			cve_id = excluded.cve_id,
 			summary = excluded.summary,
@@ -2136,7 +1609,7 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, runUUID string, repoID int64, a *git
 			updated_at = excluded.updated_at,
 			withdrawn_at = excluded.withdrawn_at
 	`,
-		runUUID, repoID, alertNumber, adv.GetGHSAID(), adv.GetCVEID(), adv.GetSummary(), adv.GetDescription(), adv.GetSeverity(),
+		repoID, alertNumber, adv.GetGHSAID(), adv.GetCVEID(), adv.GetSummary(), adv.GetDescription(), adv.GetSeverity(),
 		floatPtrToValue(adv.CVSS.GetScore()), adv.CVSS.GetVectorString(), epssPercentageValue(adv.EPSS), epssPercentileValue(adv.EPSS),
 		formatGitHubTimePtr(adv.PublishedAt), formatGitHubTimePtr(adv.UpdatedAt), formatGitHubTimePtr(adv.WithdrawnAt),
 	)
@@ -2151,8 +1624,8 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, runUUID string, repoID int64, a *git
 		"dependabot_advisory_cwes",
 	} {
 		if _, err := tx.Exec(
-			fmt.Sprintf("DELETE FROM %s WHERE run_uuid = ? AND repo_id = ? AND alert_number = ?", table),
-			runUUID, repoID, alertNumber,
+			fmt.Sprintf("DELETE FROM %s WHERE repo_id = ? AND alert_number = ?", table),
+			repoID, alertNumber,
 		); err != nil {
 			return err
 		}
@@ -2163,11 +1636,11 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, runUUID string, repoID int64, a *git
 			continue
 		}
 		_, err := tx.Exec(`
-			INSERT INTO dependabot_advisory_vulnerabilities(
-				run_uuid, repo_id, alert_number, row_num, ecosystem, package_name, severity, vulnerable_version_range,
-				first_patched_version, patched_versions, vulnerable_functions
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, runUUID, repoID, alertNumber, i+1, v.GetPackage().GetEcosystem(), v.GetPackage().GetName(), v.GetSeverity(),
+				INSERT INTO dependabot_advisory_vulnerabilities(
+					repo_id, alert_number, row_num, ecosystem, package_name, severity, vulnerable_version_range,
+					first_patched_version, patched_versions, vulnerable_functions
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`, repoID, alertNumber, i+1, v.GetPackage().GetEcosystem(), v.GetPackage().GetName(), v.GetSeverity(),
 			v.GetVulnerableVersionRange(), v.GetFirstPatchedVersion().GetIdentifier(), v.GetPatchedVersions(), strings.Join(v.VulnerableFunctions, ","))
 		if err != nil {
 			return err
@@ -2179,9 +1652,9 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, runUUID string, repoID int64, a *git
 			continue
 		}
 		_, err := tx.Exec(`
-			INSERT INTO dependabot_advisory_identifiers(run_uuid, repo_id, alert_number, row_num, value, type)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, runUUID, repoID, alertNumber, i+1, id.GetValue(), id.GetType())
+				INSERT INTO dependabot_advisory_identifiers(repo_id, alert_number, row_num, value, type)
+				VALUES (?, ?, ?, ?, ?)
+			`, repoID, alertNumber, i+1, id.GetValue(), id.GetType())
 		if err != nil {
 			return err
 		}
@@ -2192,9 +1665,9 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, runUUID string, repoID int64, a *git
 			continue
 		}
 		_, err := tx.Exec(`
-			INSERT INTO dependabot_advisory_references(run_uuid, repo_id, alert_number, row_num, url)
-			VALUES (?, ?, ?, ?, ?)
-		`, runUUID, repoID, alertNumber, i+1, ref.GetURL())
+				INSERT INTO dependabot_advisory_references(repo_id, alert_number, row_num, url)
+				VALUES (?, ?, ?, ?)
+			`, repoID, alertNumber, i+1, ref.GetURL())
 		if err != nil {
 			return err
 		}
@@ -2205,9 +1678,9 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, runUUID string, repoID int64, a *git
 			continue
 		}
 		_, err := tx.Exec(`
-			INSERT INTO dependabot_advisory_cwes(run_uuid, repo_id, alert_number, row_num, cwe_id, name)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, runUUID, repoID, alertNumber, i+1, cwe.GetCWEID(), cwe.GetName())
+				INSERT INTO dependabot_advisory_cwes(repo_id, alert_number, row_num, cwe_id, name)
+				VALUES (?, ?, ?, ?, ?)
+			`, repoID, alertNumber, i+1, cwe.GetCWEID(), cwe.GetName())
 		if err != nil {
 			return err
 		}
@@ -2216,12 +1689,12 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, runUUID string, repoID int64, a *git
 	return nil
 }
 
-func upsertCodeScanningRuleTagsTx(tx *sql.Tx, runUUID string, repoID int64, a *github.Alert) error {
+func upsertCodeScanningRuleTagsTx(tx *sql.Tx, repoID int64, a *github.Alert) error {
 	if a == nil {
 		return nil
 	}
 	alertNumber := a.GetNumber()
-	if _, err := tx.Exec(`DELETE FROM code_scanning_rule_tags WHERE run_uuid = ? AND repo_id = ? AND alert_number = ?`, runUUID, repoID, alertNumber); err != nil {
+	if _, err := tx.Exec(`DELETE FROM code_scanning_rule_tags WHERE repo_id = ? AND alert_number = ?`, repoID, alertNumber); err != nil {
 		return err
 	}
 	rule := a.GetRule()
@@ -2230,61 +1703,26 @@ func upsertCodeScanningRuleTagsTx(tx *sql.Tx, runUUID string, repoID int64, a *g
 			continue
 		}
 		if _, err := tx.Exec(`
-			INSERT INTO code_scanning_rule_tags(run_uuid, repo_id, alert_number, row_num, tag)
-			VALUES (?, ?, ?, ?, ?)
-		`, runUUID, repoID, alertNumber, i+1, tag); err != nil {
+				INSERT INTO code_scanning_rule_tags(repo_id, alert_number, row_num, tag)
+				VALUES (?, ?, ?, ?)
+			`, repoID, alertNumber, i+1, tag); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func upsertCodeScanningInstancesTx(tx *sql.Tx, runUUID string, repoID int64, a *github.Alert) error {
-	if a == nil {
-		return nil
-	}
-	alertNumber := a.GetNumber()
-	if _, err := tx.Exec(`DELETE FROM code_scanning_alert_instances WHERE run_uuid = ? AND repo_id = ? AND alert_number = ?`, runUUID, repoID, alertNumber); err != nil {
-		return err
-	}
-	for i, inst := range a.Instances {
-		if inst == nil {
-			continue
-		}
-		var startLine, endLine, startColumn, endColumn interface{}
-		path := ""
-		if inst.Location != nil {
-			path = inst.Location.GetPath()
-			startLine = nullableIntPtr(inst.Location.StartLine)
-			endLine = nullableIntPtr(inst.Location.EndLine)
-			startColumn = nullableIntPtr(inst.Location.StartColumn)
-			endColumn = nullableIntPtr(inst.Location.EndColumn)
-		}
-		_, err := tx.Exec(`
-			INSERT INTO code_scanning_alert_instances(
-				run_uuid, repo_id, alert_number, row_num, ref, analysis_key, category, environment, state,
-				commit_sha, message_text, path, start_line, end_line, start_column, end_column
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, runUUID, repoID, alertNumber, i+1, inst.GetRef(), inst.GetAnalysisKey(), inst.GetCategory(), inst.GetEnvironment(), inst.GetState(),
-			inst.GetCommitSHA(), inst.GetMessage().GetText(), path, startLine, endLine, startColumn, endColumn)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func upsertSecretScanningFirstLocationTx(tx *sql.Tx, runUUID string, repoID int64, a *github.SecretScanningAlert) error {
+func upsertSecretScanningFirstLocationTx(tx *sql.Tx, repoID int64, a *github.SecretScanningAlert) error {
 	if a == nil {
 		return nil
 	}
 	loc := a.GetFirstLocationDetected()
 	_, err := tx.Exec(`
 		INSERT INTO secret_scanning_first_locations(
-			run_uuid, repo_id, alert_number, path, start_line, end_line, start_column, end_column,
+			repo_id, alert_number, path, start_line, end_line, start_column, end_column,
 			blob_sha, blob_url, commit_sha, commit_url, pull_request_comment_url
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(run_uuid, repo_id, alert_number) DO UPDATE SET
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(repo_id, alert_number) DO UPDATE SET
 			path = excluded.path,
 			start_line = excluded.start_line,
 			end_line = excluded.end_line,
@@ -2295,233 +1733,14 @@ func upsertSecretScanningFirstLocationTx(tx *sql.Tx, runUUID string, repoID int6
 			commit_sha = excluded.commit_sha,
 			commit_url = excluded.commit_url,
 			pull_request_comment_url = excluded.pull_request_comment_url
-	`, runUUID, repoID, a.GetNumber(), loc.GetPath(), nullableIntPtr(loc.Startline), nullableIntPtr(loc.EndLine), nullableIntPtr(loc.StartColumn), nullableIntPtr(loc.EndColumn),
+	`, repoID, a.GetNumber(), loc.GetPath(), nullableIntPtr(loc.Startline), nullableIntPtr(loc.EndLine), nullableIntPtr(loc.StartColumn), nullableIntPtr(loc.EndColumn),
 		loc.GetBlobSHA(), loc.GetBlobURL(), loc.GetCommitSHA(), loc.GetCommitURL(), loc.GetPullRequestCommentURL())
 	return err
 }
 
-type rulesetRuleEntry struct {
-	RuleType       string
-	ParametersJSON string
-}
-
-func rulesetRuleEntries(rules *github.RepositoryRulesetRules) []rulesetRuleEntry {
-	if rules == nil {
-		return nil
-	}
-	raw, err := json.Marshal(rules)
-	if err != nil || len(raw) == 0 || string(raw) == "null" {
-		return nil
-	}
-	entries := make([]rulesetRuleEntry, 0)
-	if raw[0] == '[' {
-		var list []map[string]interface{}
-		if err := json.Unmarshal(raw, &list); err != nil {
-			return nil
-		}
-		for _, item := range list {
-			ruleType := stringifyAny(item["type"])
-			params := jsonString(item["parameters"])
-			entries = append(entries, rulesetRuleEntry{RuleType: ruleType, ParametersJSON: params})
-		}
-		return entries
-	}
-	var obj map[string]interface{}
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return nil
-	}
-	for k, v := range obj {
-		entries = append(entries, rulesetRuleEntry{RuleType: k, ParametersJSON: jsonString(v)})
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].RuleType < entries[j].RuleType })
-	return entries
-}
-
-func countRulesetRules(rules *github.RepositoryRulesetRules) int {
-	return len(rulesetRuleEntries(rules))
-}
-
-func upsertRulesetChildrenTx(tx *sql.Tx, runUUID string, repoID int64, rs *github.RepositoryRuleset) error {
-	if rs == nil {
-		return nil
-	}
-	rulesetID := rs.GetID()
-	for _, table := range []string{
-		"repo_ruleset_bypass_actors",
-		"repo_ruleset_rule_entries",
-		"repo_ruleset_condition_repo_ids",
-		"repo_ruleset_condition_repo_names",
-		"repo_ruleset_condition_org_ids",
-		"repo_ruleset_condition_org_names",
-		"repo_ruleset_condition_property_targets",
-	} {
-		if _, err := tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE run_uuid = ? AND repo_id = ? AND ruleset_id = ?", table), runUUID, repoID, rulesetID); err != nil {
-			return err
-		}
-	}
-
-	for i, actor := range rs.BypassActors {
-		if actor == nil {
-			continue
-		}
-		if _, err := tx.Exec(`
-			INSERT INTO repo_ruleset_bypass_actors(run_uuid, repo_id, ruleset_id, row_num, actor_id, actor_type, bypass_mode)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
-		`, runUUID, repoID, rulesetID, i+1, nullableInt64Value(actor.GetActorID()), stringValue(actor.ActorType), stringValue(actor.BypassMode)); err != nil {
-			return err
-		}
-	}
-
-	linksSelf := ""
-	linksHTML := ""
-	if rs.Links != nil {
-		if rs.Links.Self != nil {
-			linksSelf = rs.Links.Self.GetHRef()
-		}
-		if rs.Links.HTML != nil {
-			linksHTML = rs.Links.HTML.GetHRef()
-		}
-	}
-	if _, err := tx.Exec(`
-		INSERT INTO repo_ruleset_links(run_uuid, repo_id, ruleset_id, self_href, html_href)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(run_uuid, repo_id, ruleset_id) DO UPDATE SET
-			self_href = excluded.self_href,
-			html_href = excluded.html_href
-	`, runUUID, repoID, rulesetID, linksSelf, linksHTML); err != nil {
-		return err
-	}
-
-	for i, entry := range rulesetRuleEntries(rs.Rules) {
-		if _, err := tx.Exec(`
-			INSERT INTO repo_ruleset_rule_entries(run_uuid, repo_id, ruleset_id, row_num, rule_type, parameters_json)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, runUUID, repoID, rulesetID, i+1, entry.RuleType, entry.ParametersJSON); err != nil {
-			return err
-		}
-	}
-
-	conds := rs.Conditions
-	if conds == nil {
-		return nil
-	}
-	if conds.RepositoryID != nil {
-		for _, id := range conds.RepositoryID.RepositoryIDs {
-			if _, err := tx.Exec(`
-				INSERT INTO repo_ruleset_condition_repo_ids(run_uuid, repo_id, ruleset_id, repository_id)
-				VALUES (?, ?, ?, ?)
-			`, runUUID, repoID, rulesetID, id); err != nil {
-				return err
-			}
-		}
-	}
-	if conds.RepositoryName != nil {
-		for _, v := range conds.RepositoryName.Include {
-			if _, err := tx.Exec(`
-				INSERT INTO repo_ruleset_condition_repo_names(run_uuid, repo_id, ruleset_id, include_exclude, repo_name)
-				VALUES (?, ?, ?, 'include', ?)
-			`, runUUID, repoID, rulesetID, v); err != nil {
-				return err
-			}
-		}
-		for _, v := range conds.RepositoryName.Exclude {
-			if _, err := tx.Exec(`
-				INSERT INTO repo_ruleset_condition_repo_names(run_uuid, repo_id, ruleset_id, include_exclude, repo_name)
-				VALUES (?, ?, ?, 'exclude', ?)
-			`, runUUID, repoID, rulesetID, v); err != nil {
-				return err
-			}
-		}
-	}
-	if conds.OrganizationID != nil {
-		for _, id := range conds.OrganizationID.OrganizationIDs {
-			if _, err := tx.Exec(`
-				INSERT INTO repo_ruleset_condition_org_ids(run_uuid, repo_id, ruleset_id, organization_id)
-				VALUES (?, ?, ?, ?)
-			`, runUUID, repoID, rulesetID, id); err != nil {
-				return err
-			}
-		}
-	}
-	if conds.OrganizationName != nil {
-		for _, v := range conds.OrganizationName.Include {
-			if _, err := tx.Exec(`
-				INSERT INTO repo_ruleset_condition_org_names(run_uuid, repo_id, ruleset_id, include_exclude, organization_name)
-				VALUES (?, ?, ?, 'include', ?)
-			`, runUUID, repoID, rulesetID, v); err != nil {
-				return err
-			}
-		}
-		for _, v := range conds.OrganizationName.Exclude {
-			if _, err := tx.Exec(`
-				INSERT INTO repo_ruleset_condition_org_names(run_uuid, repo_id, ruleset_id, include_exclude, organization_name)
-				VALUES (?, ?, ?, 'exclude', ?)
-			`, runUUID, repoID, rulesetID, v); err != nil {
-				return err
-			}
-		}
-	}
-
-	if err := insertPropertyTargetsTx(tx, runUUID, repoID, rulesetID, "repository", conds.RepositoryProperty); err != nil {
-		return err
-	}
-	if err := insertPropertyTargetsTx(tx, runUUID, repoID, rulesetID, "organization", conds.OrganizationProperty); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func insertPropertyTargetsTx(tx *sql.Tx, runUUID string, repoID, rulesetID int64, scope string, raw interface{}) error {
-	var include []*github.RepositoryRulesetRepositoryPropertyTargetParameters
-	var exclude []*github.RepositoryRulesetRepositoryPropertyTargetParameters
-	switch prop := raw.(type) {
-	case *github.RepositoryRulesetRepositoryPropertyConditionParameters:
-		if prop == nil {
-			return nil
-		}
-		include = prop.Include
-		exclude = prop.Exclude
-	case *github.RepositoryRulesetOrganizationPropertyConditionParameters:
-		if prop == nil {
-			return nil
-		}
-		include = prop.Include
-		exclude = prop.Exclude
-	default:
-		return nil
-	}
-	for _, t := range include {
-		if t == nil {
-			continue
-		}
-		if _, err := tx.Exec(`
-			INSERT INTO repo_ruleset_condition_property_targets(
-				run_uuid, repo_id, ruleset_id, target_scope, include_exclude, name, property_values, source
-			) VALUES (?, ?, ?, ?, 'include', ?, ?, ?)
-		`, runUUID, repoID, rulesetID, scope, t.Name, strings.Join(t.PropertyValues, ","), t.GetSource()); err != nil {
-			return err
-		}
-	}
-	for _, t := range exclude {
-		if t == nil {
-			continue
-		}
-		if _, err := tx.Exec(`
-			INSERT INTO repo_ruleset_condition_property_targets(
-				run_uuid, repo_id, ruleset_id, target_scope, include_exclude, name, property_values, source
-			) VALUES (?, ?, ?, ?, 'exclude', ?, ?, ?)
-		`, runUUID, repoID, rulesetID, scope, t.Name, strings.Join(t.PropertyValues, ","), t.GetSource()); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func exportCSVReport(db *sql.DB, runUUID, outputPath string) error {
+func exportCSVReport(db *sql.DB, outputPath string) error {
 	query := `
 		SELECT
-			r.run_uuid,
 			r.repo_id,
 			r.org_login,
 			r.name,
@@ -2554,17 +1773,17 @@ func exportCSVReport(db *sql.DB, runUUID, outputPath string) error {
 				r.created_at AS repo_created_at,
 				r.updated_at AS repo_updated_at,
 				r.pushed_at AS repo_pushed_at,
-				(SELECT sd.spdx_id FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_spdx_id,
-				(SELECT sd.spdx_version FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_spdx_version,
-				(SELECT sd.document_name FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_document_name,
-				(SELECT sd.data_license FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_data_license,
-				(SELECT sd.document_namespace FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_document_namespace,
-				(SELECT sd.generated_at FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_generated_at,
-				(SELECT sd.creation_creators FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_creation_creators,
-				(SELECT sd.document_describes_count FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_document_describes_count,
-				(SELECT sd.package_count FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_package_count,
-				(SELECT sd.relationship_count FROM sbom_documents sd WHERE sd.run_uuid = ? AND sd.repo_id = r.repo_id LIMIT 1) AS sbom_relationship_count,
-			(SELECT COUNT(1) FROM repo_dependencies rd WHERE rd.run_uuid = ? AND rd.repo_id = r.repo_id) AS dependency_count,
+				(SELECT sd.spdx_id FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_spdx_id,
+				(SELECT sd.spdx_version FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_spdx_version,
+				(SELECT sd.document_name FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_document_name,
+				(SELECT sd.data_license FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_data_license,
+				(SELECT sd.document_namespace FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_document_namespace,
+				(SELECT sd.generated_at FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_generated_at,
+				(SELECT sd.creation_creators FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_creation_creators,
+				(SELECT sd.document_describes_count FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_document_describes_count,
+				(SELECT sd.package_count FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_package_count,
+				(SELECT sd.relationship_count FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_relationship_count,
+			(SELECT COUNT(1) FROM repo_dependencies rd WHERE rd.repo_id = r.repo_id) AS dependency_count,
 			(
 				SELECT COALESCE(group_concat(
 					'dependency_id=' || d.dependency_id ||
@@ -2578,11 +1797,11 @@ func exportCSVReport(db *sql.DB, runUUID, outputPath string) error {
 				), '')
 				FROM repo_dependencies rd
 				JOIN dependencies d ON d.dependency_id = rd.dependency_id
-				WHERE rd.run_uuid = ? AND rd.repo_id = r.repo_id
+				WHERE rd.repo_id = r.repo_id
 			) AS dependency_details,
-			(SELECT COUNT(1) FROM dependabot_alerts da WHERE da.run_uuid = ? AND da.repo_id = r.repo_id AND lower(da.state) = 'open') AS open_dependabot_alerts,
-			(SELECT COUNT(1) FROM dependabot_alerts da WHERE da.run_uuid = ? AND da.repo_id = r.repo_id AND lower(da.state) = 'open' AND lower(da.severity) = 'critical') AS open_critical_dependabot_alerts,
-			(SELECT COUNT(1) FROM dependabot_alerts da WHERE da.run_uuid = ? AND da.repo_id = r.repo_id) AS total_dependabot_alerts,
+			(SELECT COUNT(1) FROM dependabot_alerts da WHERE da.repo_id = r.repo_id AND lower(da.state) = 'open') AS open_dependabot_alerts,
+			(SELECT COUNT(1) FROM dependabot_alerts da WHERE da.repo_id = r.repo_id AND lower(da.state) = 'open' AND lower(da.severity) = 'critical') AS open_critical_dependabot_alerts,
+			(SELECT COUNT(1) FROM dependabot_alerts da WHERE da.repo_id = r.repo_id) AS total_dependabot_alerts,
 			(
 				SELECT COALESCE(group_concat(
 					'alert_number=' || da.alert_number ||
@@ -2599,10 +1818,10 @@ func exportCSVReport(db *sql.DB, runUUID, outputPath string) error {
 					char(10)
 				), '')
 				FROM dependabot_alerts da
-				WHERE da.run_uuid = ? AND da.repo_id = r.repo_id
+				WHERE da.repo_id = r.repo_id
 			) AS dependabot_alert_details,
-			(SELECT COUNT(1) FROM code_scanning_alerts ca WHERE ca.run_uuid = ? AND ca.repo_id = r.repo_id AND lower(ca.state) = 'open') AS open_code_scanning_alerts,
-			(SELECT COUNT(1) FROM code_scanning_alerts ca WHERE ca.run_uuid = ? AND ca.repo_id = r.repo_id) AS total_code_scanning_alerts,
+			(SELECT COUNT(1) FROM code_scanning_alerts ca WHERE ca.repo_id = r.repo_id AND lower(ca.state) = 'open') AS open_code_scanning_alerts,
+			(SELECT COUNT(1) FROM code_scanning_alerts ca WHERE ca.repo_id = r.repo_id) AS total_code_scanning_alerts,
 			(
 				SELECT COALESCE(group_concat(
 					'alert_number=' || ca.alert_number ||
@@ -2620,10 +1839,10 @@ func exportCSVReport(db *sql.DB, runUUID, outputPath string) error {
 						char(10)
 					), '')
 					FROM code_scanning_alerts ca
-				WHERE ca.run_uuid = ? AND ca.repo_id = r.repo_id
+				WHERE ca.repo_id = r.repo_id
 			) AS code_scanning_alert_details,
-			(SELECT COUNT(1) FROM secret_scanning_alerts sa WHERE sa.run_uuid = ? AND sa.repo_id = r.repo_id AND lower(sa.state) = 'open') AS open_secret_scanning_alerts,
-			(SELECT COUNT(1) FROM secret_scanning_alerts sa WHERE sa.run_uuid = ? AND sa.repo_id = r.repo_id) AS total_secret_scanning_alerts,
+			(SELECT COUNT(1) FROM secret_scanning_alerts sa WHERE sa.repo_id = r.repo_id AND lower(sa.state) = 'open') AS open_secret_scanning_alerts,
+			(SELECT COUNT(1) FROM secret_scanning_alerts sa WHERE sa.repo_id = r.repo_id) AS total_secret_scanning_alerts,
 			(
 				SELECT COALESCE(group_concat(
 					'alert_number=' || sa.alert_number ||
@@ -2636,57 +1855,13 @@ func exportCSVReport(db *sql.DB, runUUID, outputPath string) error {
 					char(10)
 				), '')
 				FROM secret_scanning_alerts sa
-				WHERE sa.run_uuid = ? AND sa.repo_id = r.repo_id
-			) AS secret_scanning_alert_details,
-			(SELECT COUNT(1) FROM repo_rulesets rr WHERE rr.run_uuid = ? AND rr.repo_id = r.repo_id) AS total_rulesets,
-				(
-						SELECT COALESCE(group_concat(
-							'ruleset_id=' || rr.ruleset_id ||
-							';name=' || COALESCE(rr.name, '') ||
-							';enforcement=' || COALESCE(rr.enforcement, '') ||
-							';target=' || COALESCE(rr.target, '') ||
-							';source=' || COALESCE(rr.source, '') ||
-							';source_type=' || COALESCE(rr.source_type, '') ||
-							';created_at=' || COALESCE(rr.created_at, '') ||
-							';updated_at=' || COALESCE(rr.updated_at, ''),
-							char(10)
-						), '')
-						FROM repo_rulesets rr
-					WHERE rr.run_uuid = ? AND rr.repo_id = r.repo_id
-				) AS ruleset_details
+				WHERE sa.repo_id = r.repo_id
+			) AS secret_scanning_alert_details
 			FROM repos r
-			WHERE r.run_uuid = ?
 		ORDER BY open_critical_dependabot_alerts DESC, open_dependabot_alerts DESC, r.full_name ASC
 	`
 
-	rows, err := db.Query(
-		query,
-		runUUID, // sbom_spdx_id
-		runUUID, // sbom_spdx_version
-		runUUID, // sbom_document_name
-		runUUID, // sbom_data_license
-		runUUID, // sbom_document_namespace
-		runUUID, // sbom_generated_at
-		runUUID, // sbom_creation_creators
-		runUUID, // sbom_document_describes_count
-		runUUID, // sbom_package_count
-		runUUID, // sbom_relationship_count
-		runUUID, // dependency_count
-		runUUID, // dependency_details
-		runUUID, // open_dependabot_alerts
-		runUUID, // open_critical_dependabot_alerts
-		runUUID, // total_dependabot_alerts
-		runUUID, // dependabot_alert_details
-		runUUID, // open_code_scanning_alerts
-		runUUID, // total_code_scanning_alerts
-		runUUID, // code_scanning_alert_details
-		runUUID, // open_secret_scanning_alerts
-		runUUID, // total_secret_scanning_alerts
-		runUUID, // secret_scanning_alert_details
-		runUUID, // total_rulesets
-		runUUID, // ruleset_details
-		runUUID, // repos filter
-	)
+	rows, err := db.Query(query)
 	if err != nil {
 		return err
 	}
