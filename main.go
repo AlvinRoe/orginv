@@ -680,10 +680,12 @@ func initSQLite(db *sql.DB) error {
 			return err
 		}
 	}
-	return nil
+	return applySchemaMigrations(db)
 }
 
-func applySchemaMigrations(db *sql.DB) error { return nil }
+func applySchemaMigrations(db *sql.DB) error {
+	return nil
+}
 
 func ensureColumns(db *sql.DB, table string, cols []schemaColumn) error {
 	existing, err := tableColumns(db, table)
@@ -771,9 +773,8 @@ func upsertRepo(db *sql.DB, org string, repo *github.Repository) error {
 			default_branch, language, open_issues_count, description, homepage, topics,
 			size_kb, forks_count, stargazers_count, has_issues, has_projects, has_wiki, has_pages,
 			has_discussions, is_fork, is_template, license_spdx_id, advanced_security_status,
-			secret_scanning_status, secret_scanning_push_protection_status, dependabot_security_updates_status,
-			created_at, updated_at, pushed_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			secret_scanning_status, secret_scanning_push_protection_status, dependabot_security_updates_status
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(repo_id) DO UPDATE SET
 			org_login = excluded.org_login,
 			name = excluded.name,
@@ -802,10 +803,7 @@ func upsertRepo(db *sql.DB, org string, repo *github.Repository) error {
 			advanced_security_status = excluded.advanced_security_status,
 			secret_scanning_status = excluded.secret_scanning_status,
 			secret_scanning_push_protection_status = excluded.secret_scanning_push_protection_status,
-			dependabot_security_updates_status = excluded.dependabot_security_updates_status,
-			created_at = excluded.created_at,
-			updated_at = excluded.updated_at,
-			pushed_at = excluded.pushed_at
+			dependabot_security_updates_status = excluded.dependabot_security_updates_status
 	`,
 		repo.GetID(),
 		org,
@@ -836,9 +834,6 @@ func upsertRepo(db *sql.DB, org string, repo *github.Repository) error {
 		secretScanningStatus,
 		secretScanningPushProtectionStatus,
 		dependabotSecurityUpdatesStatus,
-		formatGitHubTimePtr(repo.CreatedAt),
-		formatGitHubTimePtr(repo.UpdatedAt),
-		formatGitHubTimePtr(repo.PushedAt),
 	)
 	if err != nil {
 		return err
@@ -1770,9 +1765,6 @@ func exportCSVReport(db *sql.DB, outputPath string) error {
 				r.secret_scanning_status,
 				r.secret_scanning_push_protection_status,
 				r.dependabot_security_updates_status,
-				r.created_at AS repo_created_at,
-				r.updated_at AS repo_updated_at,
-				r.pushed_at AS repo_pushed_at,
 				(SELECT sd.spdx_id FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_spdx_id,
 				(SELECT sd.spdx_version FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_spdx_version,
 				(SELECT sd.document_name FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_document_name,
