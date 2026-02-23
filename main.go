@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/csv"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -39,11 +38,6 @@ type dbWriteOp struct {
 	priority int
 	rows     int
 	apply    func(*sql.DB) error
-}
-
-type schemaColumn struct {
-	name       string
-	definition string
 }
 
 type codeScanningInstanceSnapshot struct {
@@ -119,6 +113,9 @@ func main() {
 	activeRepos := make([]*github.Repository, 0, len(repos))
 
 	for _, repo := range repos {
+		if isIgnoredRepoName(repo.GetName()) {
+			continue
+		}
 		repoID := repo.GetID()
 		if err := upsertRepo(db, cfg.Org, repo); err != nil {
 			log.Printf("failed to upsert repo %s: %v", repo.GetFullName(), err)
@@ -126,6 +123,7 @@ func main() {
 		}
 		repoIDByName[repo.GetFullName()] = repoID
 		repoIDByName[repo.GetName()] = repoID
+		repoIDByName[repoIDKey(repoID)] = repoID
 		if !repo.GetArchived() && !repo.GetDisabled() {
 			activeRepos = append(activeRepos, repo)
 		}
@@ -348,6 +346,10 @@ func newGitHubClient(ctx context.Context, token string) *github.Client {
 }
 
 func initSQLite(db *sql.DB) error {
+	if err := applySchemaMigrations(db); err != nil {
+		return err
+	}
+
 	schema := []string{
 		`PRAGMA foreign_keys = ON;`,
 		`PRAGMA journal_mode = WAL;`,
@@ -406,46 +408,20 @@ func initSQLite(db *sql.DB) error {
 			web_commit_signoff_required INTEGER,
 			delete_branch_on_merge INTEGER,
 			use_squash_pr_title_as_default INTEGER,
-			squash_merge_commit_title TEXT,
-			squash_merge_commit_message TEXT,
-			merge_commit_title TEXT,
-			merge_commit_message TEXT,
 			has_downloads INTEGER,
 			license_key TEXT,
 			license_name TEXT,
 			license_url TEXT,
-			license_node_id TEXT,
 			secret_scanning_validity_checks_status TEXT,
-			master_branch TEXT,
-			role_name TEXT,
-			parent_repo_id INTEGER,
-			source_repo_id INTEGER,
-			template_repo_id INTEGER,
-			organization_id INTEGER,
 			team_id INTEGER,
-			private_forks INTEGER,
-			custom_properties_json TEXT
+			immerse_ask_id TEXT,
+			immerse_jfrog_project_key TEXT,
+			immerse_sast_compliant INTEGER
 		);`,
-		`CREATE TABLE IF NOT EXISTS repo_owners (
-			repo_id INTEGER PRIMARY KEY,
-			owner_id INTEGER,
-			login TEXT,
-			node_id TEXT,
-			type TEXT,
-			site_admin INTEGER,
-			html_url TEXT
-		);`,
-		`CREATE TABLE IF NOT EXISTS repo_merge_policies (
-			repo_id INTEGER PRIMARY KEY,
-			allow_rebase_merge INTEGER,
-			allow_update_branch INTEGER,
-			allow_squash_merge INTEGER,
-			allow_merge_commit INTEGER,
-			allow_auto_merge INTEGER,
-			allow_forking INTEGER,
-			delete_branch_on_merge INTEGER,
-			use_squash_pr_title_as_default INTEGER,
-			web_commit_signoff_required INTEGER
+		`CREATE TABLE IF NOT EXISTS repo_sast_scanners (
+			repo_id INTEGER NOT NULL,
+			scanner TEXT NOT NULL,
+			PRIMARY KEY (repo_id, scanner)
 		);`,
 		`CREATE TABLE IF NOT EXISTS dependencies (
 			dependency_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -463,10 +439,7 @@ func initSQLite(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS repo_dependencies (
 			repo_id INTEGER NOT NULL,
 			dependency_id INTEGER NOT NULL,
-			source TEXT NOT NULL,
-			snapshot_at TEXT NOT NULL,
-			scope TEXT,
-			PRIMARY KEY (repo_id, dependency_id, source),
+			PRIMARY KEY (repo_id, dependency_id),
 			FOREIGN KEY(dependency_id) REFERENCES dependencies(dependency_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS sbom_documents (
@@ -482,11 +455,6 @@ func initSQLite(db *sql.DB) error {
 			document_describes_count INTEGER,
 			package_count INTEGER,
 			relationship_count INTEGER
-		);`,
-		`CREATE TABLE IF NOT EXISTS sbom_document_describes (
-			sbom_id INTEGER NOT NULL,
-			spdx_element_id TEXT NOT NULL,
-			PRIMARY KEY (sbom_id, spdx_element_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS sbom_package_external_refs (
 			sbom_id INTEGER NOT NULL,
@@ -533,9 +501,8 @@ func initSQLite(db *sql.DB) error {
 			PRIMARY KEY (repo_id, alert_number),
 			FOREIGN KEY(dependency_id) REFERENCES dependencies(dependency_id)
 		);`,
-		`CREATE TABLE IF NOT EXISTS dependabot_security_advisories (
-			repo_id INTEGER NOT NULL,
-			alert_number INTEGER NOT NULL,
+		`CREATE TABLE IF NOT EXISTS security_advisories (
+			advisory_id INTEGER PRIMARY KEY AUTOINCREMENT,
 			ghsa_id TEXT,
 			cve_id TEXT,
 			summary TEXT,
@@ -548,6 +515,12 @@ func initSQLite(db *sql.DB) error {
 			published_at TEXT,
 			updated_at TEXT,
 			withdrawn_at TEXT,
+			UNIQUE (ghsa_id, cve_id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS dependabot_alert_advisories (
+			repo_id INTEGER NOT NULL,
+			alert_number INTEGER NOT NULL,
+			advisory_id INTEGER NOT NULL,
 			PRIMARY KEY (repo_id, alert_number)
 		);`,
 		`CREATE TABLE IF NOT EXISTS dependabot_advisory_vulnerabilities (
@@ -559,32 +532,40 @@ func initSQLite(db *sql.DB) error {
 			severity TEXT,
 			vulnerable_version_range TEXT,
 			first_patched_version TEXT,
-			patched_versions TEXT,
-			vulnerable_functions TEXT,
 			PRIMARY KEY (repo_id, alert_number, row_num)
+		);`,
+		`CREATE TABLE IF NOT EXISTS dependabot_identifiers (
+			identifier_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			type TEXT NOT NULL,
+			value TEXT NOT NULL,
+			UNIQUE (type, value)
 		);`,
 		`CREATE TABLE IF NOT EXISTS dependabot_advisory_identifiers (
 			repo_id INTEGER NOT NULL,
 			alert_number INTEGER NOT NULL,
-			row_num INTEGER NOT NULL,
-			value TEXT,
-			type TEXT,
-			PRIMARY KEY (repo_id, alert_number, row_num)
+			identifier_id INTEGER NOT NULL,
+			PRIMARY KEY (repo_id, alert_number, identifier_id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS dependabot_references (
+			reference_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			url TEXT NOT NULL UNIQUE
 		);`,
 		`CREATE TABLE IF NOT EXISTS dependabot_advisory_references (
 			repo_id INTEGER NOT NULL,
 			alert_number INTEGER NOT NULL,
-			row_num INTEGER NOT NULL,
-			url TEXT,
-			PRIMARY KEY (repo_id, alert_number, row_num)
+			reference_id INTEGER NOT NULL,
+			ref_num INTEGER NOT NULL,
+			PRIMARY KEY (repo_id, alert_number, reference_id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS cwes (
+			cwe_id TEXT PRIMARY KEY,
+			name TEXT
 		);`,
 		`CREATE TABLE IF NOT EXISTS dependabot_advisory_cwes (
 			repo_id INTEGER NOT NULL,
 			alert_number INTEGER NOT NULL,
-			row_num INTEGER NOT NULL,
-			cwe_id TEXT,
-			name TEXT,
-			PRIMARY KEY (repo_id, alert_number, row_num)
+			cwe_id TEXT NOT NULL,
+			PRIMARY KEY (repo_id, alert_number, cwe_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS code_scanning_alerts (
 			repo_id INTEGER NOT NULL,
@@ -593,7 +574,6 @@ func initSQLite(db *sql.DB) error {
 			rule_id TEXT,
 			tool TEXT,
 			severity TEXT,
-			security_severity TEXT,
 			created_at TEXT,
 			fixed_at TEXT,
 			most_recent_ref TEXT,
@@ -621,12 +601,15 @@ func initSQLite(db *sql.DB) error {
 			most_recent_environment TEXT,
 			PRIMARY KEY (repo_id, alert_number)
 		);`,
+		`CREATE TABLE IF NOT EXISTS code_scanning_tags (
+			tag_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			tag TEXT NOT NULL UNIQUE
+		);`,
 		`CREATE TABLE IF NOT EXISTS code_scanning_rule_tags (
 			repo_id INTEGER NOT NULL,
 			alert_number INTEGER NOT NULL,
-			row_num INTEGER NOT NULL,
-			tag TEXT,
-			PRIMARY KEY (repo_id, alert_number, row_num)
+			tag_id INTEGER NOT NULL,
+			PRIMARY KEY (repo_id, alert_number, tag_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS secret_scanning_alerts (
 			repo_id INTEGER NOT NULL,
@@ -680,54 +663,51 @@ func initSQLite(db *sql.DB) error {
 			return err
 		}
 	}
-	return applySchemaMigrations(db)
+	return nil
 }
 
 func applySchemaMigrations(db *sql.DB) error {
-	return nil
-}
-
-func ensureColumns(db *sql.DB, table string, cols []schemaColumn) error {
-	existing, err := tableColumns(db, table)
+	drops := []string{
+		"secret_scanning_first_locations",
+		"secret_scanning_alerts",
+		"code_scanning_rule_tags",
+		"code_scanning_tags",
+		"code_scanning_alerts",
+		"dependabot_advisory_cwes",
+		"cwes",
+		"dependabot_advisory_references",
+		"dependabot_references",
+		"dependabot_advisory_identifiers",
+		"dependabot_identifiers",
+		"dependabot_advisory_vulnerabilities",
+		"dependabot_alert_advisories",
+		"security_advisories",
+		"dependabot_security_advisories",
+		"dependabot_alerts",
+		"sbom_relationships",
+		"sbom_package_external_refs",
+		"sbom_document_describes",
+		"sbom_documents",
+		"repo_dependencies",
+		"dependencies",
+		"repo_sast_scanners",
+		"repo_merge_policies",
+		"repo_owners",
+		"repos",
+	}
+	if _, err := db.Exec(`PRAGMA foreign_keys = OFF;`); err != nil {
+		return err
+	}
+	for _, table := range drops {
+		if _, err := db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", table)); err != nil {
+			return err
+		}
+	}
+	_, err := db.Exec(`PRAGMA foreign_keys = ON;`)
 	if err != nil {
 		return err
 	}
-	for _, col := range cols {
-		if _, ok := existing[col.name]; ok {
-			continue
-		}
-		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, col.name, col.definition)
-		if _, err := db.Exec(stmt); err != nil {
-			return fmt.Errorf("failed adding column %s.%s: %w", table, col.name, err)
-		}
-	}
 	return nil
-}
-
-func tableColumns(db *sql.DB, table string) (map[string]struct{}, error) {
-	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	cols := make(map[string]struct{})
-	for rows.Next() {
-		var cid int
-		var name string
-		var colType string
-		var notNull int
-		var defaultValue interface{}
-		var pk int
-		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultValue, &pk); err != nil {
-			return nil, err
-		}
-		cols[name] = struct{}{}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return cols, nil
 }
 
 func upsertRepo(db *sql.DB, org string, repo *github.Repository) error {
@@ -736,13 +716,11 @@ func upsertRepo(db *sql.DB, org string, repo *github.Repository) error {
 	licenseKey := ""
 	licenseName := ""
 	licenseURL := ""
-	licenseNodeID := ""
 	if repo.License != nil {
 		licenseSPDX = repo.License.GetSPDXID()
 		licenseKey = repo.License.GetKey()
 		licenseName = repo.License.GetName()
 		licenseURL = repo.License.GetURL()
-		licenseNodeID = ""
 	}
 	advancedSecurityStatus := ""
 	secretScanningStatus := ""
@@ -839,7 +817,7 @@ func upsertRepo(db *sql.DB, org string, repo *github.Repository) error {
 		return err
 	}
 
-	customPropertiesJSON := jsonString(repo.CustomProperties)
+	immerseAskID, immerseJFrogProjectKey, immerseSASTCompliant, immerseSASTScanners := extractImmerseCustomProperties(repo.CustomProperties)
 
 	_, err = db.Exec(`
 		UPDATE repos
@@ -849,12 +827,10 @@ func upsertRepo(db *sql.DB, org string, repo *github.Repository) error {
 			network_count = ?, subscribers_count = ?, watchers_count = ?, watchers = ?, auto_init = ?,
 			allow_rebase_merge = ?, allow_update_branch = ?, allow_squash_merge = ?, allow_merge_commit = ?,
 			allow_auto_merge = ?, allow_forking = ?, web_commit_signoff_required = ?, delete_branch_on_merge = ?,
-			use_squash_pr_title_as_default = ?, squash_merge_commit_title = ?, squash_merge_commit_message = ?,
-			merge_commit_title = ?, merge_commit_message = ?, has_downloads = ?,
-			license_key = ?, license_name = ?, license_url = ?, license_node_id = ?,
-			secret_scanning_validity_checks_status = ?, master_branch = ?, role_name = ?,
-			parent_repo_id = ?, source_repo_id = ?, template_repo_id = ?, organization_id = ?, team_id = ?,
-			private_forks = ?, custom_properties_json = ?
+			use_squash_pr_title_as_default = ?, has_downloads = ?,
+			license_key = ?, license_name = ?, license_url = ?,
+			secret_scanning_validity_checks_status = ?, team_id = ?,
+			immerse_ask_id = ?, immerse_jfrog_project_key = ?, immerse_sast_compliant = ?
 		WHERE repo_id = ?
 	`,
 		repo.GetNodeID(), repo.GetOwner().GetLogin(), nullableInt64Value(repo.GetOwner().GetID()), repo.GetOwner().GetType(), boolToInt(repo.GetOwner().GetSiteAdmin()),
@@ -862,56 +838,17 @@ func upsertRepo(db *sql.DB, org string, repo *github.Repository) error {
 		repo.GetNetworkCount(), repo.GetSubscribersCount(), repo.GetWatchersCount(), repo.GetWatchers(), boolToInt(repo.GetAutoInit()),
 		boolToInt(repo.GetAllowRebaseMerge()), boolToInt(repo.GetAllowUpdateBranch()), boolToInt(repo.GetAllowSquashMerge()), boolToInt(repo.GetAllowMergeCommit()),
 		boolToInt(repo.GetAllowAutoMerge()), boolToInt(repo.GetAllowForking()), boolToInt(repo.GetWebCommitSignoffRequired()), boolToInt(repo.GetDeleteBranchOnMerge()),
-		boolToInt(repo.GetUseSquashPRTitleAsDefault()), repo.GetSquashMergeCommitTitle(), repo.GetSquashMergeCommitMessage(),
-		repo.GetMergeCommitTitle(), repo.GetMergeCommitMessage(), boolToInt(repo.GetHasDownloads()),
-		licenseKey, licenseName, licenseURL, licenseNodeID,
-		secretScanningValidityChecksStatus, repo.GetMasterBranch(), repo.GetRoleName(),
-		nullableInt64Value(repo.GetParent().GetID()), nullableInt64Value(repo.GetSource().GetID()), nullableInt64Value(repo.GetTemplateRepository().GetID()), nullableInt64Value(repo.GetOrganization().GetID()), nullableInt64Value(repo.GetTeamID()),
-		nil, customPropertiesJSON,
+		boolToInt(repo.GetUseSquashPRTitleAsDefault()), boolToInt(repo.GetHasDownloads()),
+		licenseKey, licenseName, licenseURL,
+		secretScanningValidityChecksStatus, nullableInt64Value(repo.GetTeamID()),
+		immerseAskID, immerseJFrogProjectKey, immerseSASTCompliant,
 		repo.GetID(),
 	)
 	if err != nil {
 		return err
 	}
 
-	if _, err = db.Exec(`
-		INSERT INTO repo_owners(repo_id, owner_id, login, node_id, type, site_admin, html_url)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(repo_id) DO UPDATE SET
-			owner_id = excluded.owner_id,
-			login = excluded.login,
-			node_id = excluded.node_id,
-			type = excluded.type,
-			site_admin = excluded.site_admin,
-			html_url = excluded.html_url
-	`,
-		repo.GetID(), nullableInt64Value(repo.GetOwner().GetID()), repo.GetOwner().GetLogin(), repo.GetOwner().GetNodeID(), repo.GetOwner().GetType(), boolToInt(repo.GetOwner().GetSiteAdmin()), repo.GetOwner().GetHTMLURL(),
-	); err != nil {
-		return err
-	}
-
-	_, err = db.Exec(`
-		INSERT INTO repo_merge_policies(
-			repo_id, allow_rebase_merge, allow_update_branch, allow_squash_merge, allow_merge_commit,
-			allow_auto_merge, allow_forking, delete_branch_on_merge, use_squash_pr_title_as_default, web_commit_signoff_required
-		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(repo_id) DO UPDATE SET
-			allow_rebase_merge = excluded.allow_rebase_merge,
-			allow_update_branch = excluded.allow_update_branch,
-			allow_squash_merge = excluded.allow_squash_merge,
-			allow_merge_commit = excluded.allow_merge_commit,
-			allow_auto_merge = excluded.allow_auto_merge,
-			allow_forking = excluded.allow_forking,
-			delete_branch_on_merge = excluded.delete_branch_on_merge,
-			use_squash_pr_title_as_default = excluded.use_squash_pr_title_as_default,
-			web_commit_signoff_required = excluded.web_commit_signoff_required
-	`,
-		repo.GetID(), boolToInt(repo.GetAllowRebaseMerge()), boolToInt(repo.GetAllowUpdateBranch()), boolToInt(repo.GetAllowSquashMerge()),
-		boolToInt(repo.GetAllowMergeCommit()), boolToInt(repo.GetAllowAutoMerge()), boolToInt(repo.GetAllowForking()),
-		boolToInt(repo.GetDeleteBranchOnMerge()), boolToInt(repo.GetUseSquashPRTitleAsDefault()), boolToInt(repo.GetWebCommitSignoffRequired()),
-	)
-	return err
+	return upsertRepoSASTScanners(db, repo.GetID(), immerseSASTScanners)
 }
 
 func fetchAllRepos(ctx context.Context, client *github.Client, org string, perPage int) ([]*github.Repository, error) {
@@ -1032,12 +969,9 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 		}
 		pkgIDMap[pkg.GetSPDXID()] = depID
 		if _, err := tx.Exec(`
-				INSERT INTO repo_dependencies(repo_id, dependency_id, source, snapshot_at, scope)
-				VALUES (?, ?, ?, ?, ?)
-				ON CONFLICT(repo_id, dependency_id, source) DO UPDATE SET
-					snapshot_at = excluded.snapshot_at,
-					scope = excluded.scope
-			`, repoID, depID, "sbom", time.Now().UTC().Format(time.RFC3339), pkg.GetSPDXID()); err != nil {
+				INSERT OR IGNORE INTO repo_dependencies(repo_id, dependency_id)
+				VALUES (?, ?)
+			`, repoID, depID); err != nil {
 			return err
 		}
 
@@ -1053,18 +987,6 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 			if err != nil {
 				return err
 			}
-		}
-	}
-
-	for _, described := range doc.DocumentDescribes {
-		if strings.TrimSpace(described) == "" {
-			continue
-		}
-		if _, err := tx.Exec(`
-			INSERT OR IGNORE INTO sbom_document_describes(sbom_id, spdx_element_id)
-			VALUES (?, ?)
-		`, sbomID, described); err != nil {
-			return err
 		}
 	}
 
@@ -1319,18 +1241,17 @@ func ingestCodeScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts 
 	stmt, err := tx.Prepare(`
 		INSERT INTO code_scanning_alerts(
 			repo_id, alert_number, state, rule_id, tool, severity,
-			security_severity, created_at, fixed_at, most_recent_ref, most_recent_commit_sha,
+			created_at, fixed_at, most_recent_ref, most_recent_commit_sha,
 			most_recent_path, most_recent_start_line, most_recent_end_line, most_recent_start_column,
 			most_recent_end_column, most_recent_state, most_recent_category, most_recent_classifications,
 			updated_at, closed_at, url, html_url, instances_url, dismissed_at, dismissed_reason, dismissed_comment,
 			rule_description, tool_guid, tool_version, most_recent_analysis_key, most_recent_environment
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(repo_id, alert_number) DO UPDATE SET
 			state = excluded.state,
 			rule_id = excluded.rule_id,
 			tool = excluded.tool,
 			severity = excluded.severity,
-			security_severity = excluded.security_severity,
 			created_at = excluded.created_at,
 			fixed_at = excluded.fixed_at,
 			most_recent_ref = excluded.most_recent_ref,
@@ -1396,7 +1317,6 @@ func ingestCodeScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts 
 			a.GetState(),
 			ruleID,
 			toolName,
-			a.GetRuleSeverity(),
 			securitySeverity,
 			formatGitHubTimePtr(a.CreatedAt),
 			formatGitHubTimePtr(a.FixedAt),
@@ -1584,32 +1504,18 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAl
 	}
 	alertNumber := a.GetNumber()
 	adv := a.GetSecurityAdvisory()
-
-	_, err := tx.Exec(`
-		INSERT INTO dependabot_security_advisories(
-			repo_id, alert_number, ghsa_id, cve_id, summary, description, severity,
-			cvss_score, cvss_vector_string, epss_percentage, epss_percentile, published_at, updated_at, withdrawn_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(repo_id, alert_number) DO UPDATE SET
-			ghsa_id = excluded.ghsa_id,
-			cve_id = excluded.cve_id,
-			summary = excluded.summary,
-			description = excluded.description,
-			severity = excluded.severity,
-			cvss_score = excluded.cvss_score,
-			cvss_vector_string = excluded.cvss_vector_string,
-			epss_percentage = excluded.epss_percentage,
-			epss_percentile = excluded.epss_percentile,
-			published_at = excluded.published_at,
-			updated_at = excluded.updated_at,
-			withdrawn_at = excluded.withdrawn_at
-	`,
-		repoID, alertNumber, adv.GetGHSAID(), adv.GetCVEID(), adv.GetSummary(), adv.GetDescription(), adv.GetSeverity(),
-		floatPtrToValue(adv.CVSS.GetScore()), adv.CVSS.GetVectorString(), epssPercentageValue(adv.EPSS), epssPercentileValue(adv.EPSS),
-		formatGitHubTimePtr(adv.PublishedAt), formatGitHubTimePtr(adv.UpdatedAt), formatGitHubTimePtr(adv.WithdrawnAt),
-	)
+	advisoryID, err := upsertSecurityAdvisoryTx(tx, adv)
 	if err != nil {
 		return err
+	}
+	if advisoryID != 0 {
+		if _, err := tx.Exec(`
+			INSERT INTO dependabot_alert_advisories(repo_id, alert_number, advisory_id)
+			VALUES (?, ?, ?)
+			ON CONFLICT(repo_id, alert_number) DO UPDATE SET advisory_id = excluded.advisory_id
+		`, repoID, alertNumber, advisoryID); err != nil {
+			return err
+		}
 	}
 
 	for _, table := range []string{
@@ -1633,23 +1539,27 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAl
 		_, err := tx.Exec(`
 				INSERT INTO dependabot_advisory_vulnerabilities(
 					repo_id, alert_number, row_num, ecosystem, package_name, severity, vulnerable_version_range,
-					first_patched_version, patched_versions, vulnerable_functions
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+					first_patched_version
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 			`, repoID, alertNumber, i+1, v.GetPackage().GetEcosystem(), v.GetPackage().GetName(), v.GetSeverity(),
-			v.GetVulnerableVersionRange(), v.GetFirstPatchedVersion().GetIdentifier(), v.GetPatchedVersions(), strings.Join(v.VulnerableFunctions, ","))
+			v.GetVulnerableVersionRange(), v.GetFirstPatchedVersion().GetIdentifier())
 		if err != nil {
 			return err
 		}
 	}
 
-	for i, id := range adv.Identifiers {
+	for _, id := range adv.Identifiers {
 		if id == nil {
 			continue
 		}
-		_, err := tx.Exec(`
-				INSERT INTO dependabot_advisory_identifiers(repo_id, alert_number, row_num, value, type)
-				VALUES (?, ?, ?, ?, ?)
-			`, repoID, alertNumber, i+1, id.GetValue(), id.GetType())
+		identifierID, err := upsertDependabotIdentifierTx(tx, id.GetType(), id.GetValue())
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(`
+				INSERT OR IGNORE INTO dependabot_advisory_identifiers(repo_id, alert_number, identifier_id)
+				VALUES (?, ?, ?)
+			`, repoID, alertNumber, identifierID)
 		if err != nil {
 			return err
 		}
@@ -1659,29 +1569,181 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAl
 		if ref == nil {
 			continue
 		}
-		_, err := tx.Exec(`
-				INSERT INTO dependabot_advisory_references(repo_id, alert_number, row_num, url)
+		referenceID, err := upsertDependabotReferenceTx(tx, ref.GetURL())
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(`
+				INSERT OR IGNORE INTO dependabot_advisory_references(repo_id, alert_number, reference_id, ref_num)
 				VALUES (?, ?, ?, ?)
-			`, repoID, alertNumber, i+1, ref.GetURL())
+			`, repoID, alertNumber, referenceID, i+1)
 		if err != nil {
 			return err
 		}
 	}
 
-	for i, cwe := range adv.CWEs {
+	for _, cwe := range adv.CWEs {
 		if cwe == nil {
 			continue
 		}
+		cweID := strings.TrimSpace(cwe.GetCWEID())
+		if cweID == "" {
+			continue
+		}
+		if err := upsertCWETx(tx, cweID, cwe.GetName()); err != nil {
+			return err
+		}
 		_, err := tx.Exec(`
-				INSERT INTO dependabot_advisory_cwes(repo_id, alert_number, row_num, cwe_id, name)
-				VALUES (?, ?, ?, ?, ?)
-			`, repoID, alertNumber, i+1, cwe.GetCWEID(), cwe.GetName())
+				INSERT OR IGNORE INTO dependabot_advisory_cwes(repo_id, alert_number, cwe_id)
+				VALUES (?, ?, ?)
+			`, repoID, alertNumber, cweID)
 		if err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+func upsertSecurityAdvisoryTx(tx *sql.Tx, adv *github.DependabotSecurityAdvisory) (int64, error) {
+	ghsaID := ""
+	cveID := ""
+	if adv != nil {
+		ghsaID = strings.TrimSpace(adv.GetGHSAID())
+		cveID = strings.TrimSpace(adv.GetCVEID())
+	}
+	if ghsaID == "" && cveID == "" {
+		return 0, nil
+	}
+
+	var existingID int64
+	err := tx.QueryRow(`
+		SELECT advisory_id
+		FROM security_advisories
+		WHERE ghsa_id = ? AND cve_id = ?
+		LIMIT 1
+	`, ghsaID, cveID).Scan(&existingID)
+	if err != nil && err != sql.ErrNoRows {
+		return 0, err
+	}
+
+	cvssScore := interface{}(nil)
+	cvssVector := ""
+	epssPercentage := interface{}(nil)
+	epssPercentile := interface{}(nil)
+	publishedAt := ""
+	updatedAt := ""
+	withdrawnAt := ""
+	summary := ""
+	description := ""
+	severity := ""
+	if adv != nil {
+		if adv.CVSS != nil {
+			cvssScore = floatPtrToValue(adv.CVSS.Score)
+			cvssVector = adv.CVSS.GetVectorString()
+		}
+		epssPercentage = epssPercentageValue(adv.EPSS)
+		epssPercentile = epssPercentileValue(adv.EPSS)
+		publishedAt = formatGitHubTimePtr(adv.PublishedAt)
+		updatedAt = formatGitHubTimePtr(adv.UpdatedAt)
+		withdrawnAt = formatGitHubTimePtr(adv.WithdrawnAt)
+		summary = adv.GetSummary()
+		description = adv.GetDescription()
+		severity = adv.GetSeverity()
+	}
+
+	if existingID != 0 {
+		_, err = tx.Exec(`
+			UPDATE security_advisories
+			SET
+				summary = ?,
+				description = ?,
+				severity = ?,
+				cvss_score = ?,
+				cvss_vector_string = ?,
+				epss_percentage = ?,
+				epss_percentile = ?,
+				published_at = ?,
+				updated_at = ?,
+				withdrawn_at = ?
+			WHERE advisory_id = ?
+		`, summary, description, severity, cvssScore, cvssVector, epssPercentage, epssPercentile, publishedAt, updatedAt, withdrawnAt, existingID)
+		return existingID, err
+	}
+
+	res, err := tx.Exec(`
+		INSERT INTO security_advisories(
+			ghsa_id, cve_id, summary, description, severity, cvss_score,
+			cvss_vector_string, epss_percentage, epss_percentile, published_at, updated_at, withdrawn_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, ghsaID, cveID, summary, description, severity, cvssScore, cvssVector, epssPercentage, epssPercentile, publishedAt, updatedAt, withdrawnAt)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func upsertDependabotIdentifierTx(tx *sql.Tx, identifierType, value string) (int64, error) {
+	identifierType = strings.TrimSpace(identifierType)
+	value = strings.TrimSpace(value)
+	if identifierType == "" || value == "" {
+		return 0, fmt.Errorf("dependabot identifier missing type or value")
+	}
+	res, err := tx.Exec(`
+		INSERT OR IGNORE INTO dependabot_identifiers(type, value)
+		VALUES (?, ?)
+	`, identifierType, value)
+	if err != nil {
+		return 0, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if id != 0 {
+		return id, nil
+	}
+	if err := tx.QueryRow(`
+		SELECT identifier_id FROM dependabot_identifiers
+		WHERE type = ? AND value = ?
+	`, identifierType, value).Scan(&id); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+func upsertDependabotReferenceTx(tx *sql.Tx, url string) (int64, error) {
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return 0, fmt.Errorf("dependabot advisory reference url is empty")
+	}
+	res, err := tx.Exec(`
+		INSERT OR IGNORE INTO dependabot_references(url)
+		VALUES (?)
+	`, url)
+	if err != nil {
+		return 0, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if id != 0 {
+		return id, nil
+	}
+	if err := tx.QueryRow(`SELECT reference_id FROM dependabot_references WHERE url = ?`, url).Scan(&id); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+func upsertCWETx(tx *sql.Tx, cweID, name string) error {
+	_, err := tx.Exec(`
+		INSERT INTO cwes(cwe_id, name)
+		VALUES (?, ?)
+		ON CONFLICT(cwe_id) DO UPDATE SET name = excluded.name
+	`, cweID, name)
+	return err
 }
 
 func upsertCodeScanningRuleTagsTx(tx *sql.Tx, repoID int64, a *github.Alert) error {
@@ -1693,14 +1755,27 @@ func upsertCodeScanningRuleTagsTx(tx *sql.Tx, repoID int64, a *github.Alert) err
 		return err
 	}
 	rule := a.GetRule()
-	for i, tag := range rule.Tags {
+	for _, tag := range rule.Tags {
 		if strings.TrimSpace(tag) == "" {
 			continue
 		}
+		res, err := tx.Exec(`INSERT OR IGNORE INTO code_scanning_tags(tag) VALUES (?)`, tag)
+		if err != nil {
+			return err
+		}
+		tagID, err := res.LastInsertId()
+		if err != nil {
+			return err
+		}
+		if tagID == 0 {
+			if err := tx.QueryRow(`SELECT tag_id FROM code_scanning_tags WHERE tag = ?`, tag).Scan(&tagID); err != nil {
+				return err
+			}
+		}
 		if _, err := tx.Exec(`
-				INSERT INTO code_scanning_rule_tags(repo_id, alert_number, row_num, tag)
-				VALUES (?, ?, ?, ?)
-			`, repoID, alertNumber, i+1, tag); err != nil {
+				INSERT OR IGNORE INTO code_scanning_rule_tags(repo_id, alert_number, tag_id)
+				VALUES (?, ?, ?)
+			`, repoID, alertNumber, tagID); err != nil {
 			return err
 		}
 	}
@@ -1765,6 +1840,9 @@ func exportCSVReport(db *sql.DB, outputPath string) error {
 				r.secret_scanning_status,
 				r.secret_scanning_push_protection_status,
 				r.dependabot_security_updates_status,
+				r.immerse_ask_id,
+				r.immerse_jfrog_project_key,
+				r.immerse_sast_compliant,
 				(SELECT sd.spdx_id FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_spdx_id,
 				(SELECT sd.spdx_version FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_spdx_version,
 				(SELECT sd.document_name FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_document_name,
@@ -1821,7 +1899,6 @@ func exportCSVReport(db *sql.DB, outputPath string) error {
 					';rule_id=' || COALESCE(ca.rule_id, '') ||
 					';tool=' || COALESCE(ca.tool, '') ||
 						';severity=' || COALESCE(ca.severity, '') ||
-						';security_severity=' || COALESCE(ca.security_severity, '') ||
 						';created_at=' || COALESCE(ca.created_at, '') ||
 						';fixed_at=' || COALESCE(ca.fixed_at, '') ||
 						';most_recent_ref=' || COALESCE(ca.most_recent_ref, '') ||
@@ -1850,6 +1927,7 @@ func exportCSVReport(db *sql.DB, outputPath string) error {
 				WHERE sa.repo_id = r.repo_id
 			) AS secret_scanning_alert_details
 			FROM repos r
+			WHERE lower(r.name) != '.github'
 		ORDER BY open_critical_dependabot_alerts DESC, open_dependabot_alerts DESC, r.full_name ASC
 	`
 
@@ -1905,9 +1983,6 @@ func stringPtr(v string) *string {
 
 func resolveAlertRepoID(repoIDByName map[string]int64, repo *github.Repository) (int64, bool) {
 	if repo != nil {
-		if repoID := repo.GetID(); repoID != 0 {
-			return repoID, true
-		}
 		if fullName := repo.GetFullName(); fullName != "" {
 			if id, ok := repoIDByName[fullName]; ok {
 				return id, true
@@ -1915,6 +1990,11 @@ func resolveAlertRepoID(repoIDByName map[string]int64, repo *github.Repository) 
 		}
 		if name := repo.GetName(); name != "" {
 			if id, ok := repoIDByName[name]; ok {
+				return id, true
+			}
+		}
+		if repoID := repo.GetID(); repoID != 0 {
+			if id, ok := repoIDByName[repoIDKey(repoID)]; ok {
 				return id, true
 			}
 		}
@@ -2162,37 +2242,116 @@ func mostRecentEnvironment(inst *github.MostRecentInstance) string {
 	return inst.GetEnvironment()
 }
 
-func jsonString(v interface{}) string {
-	if v == nil {
-		return ""
-	}
-	b, err := json.Marshal(v)
-	if err != nil {
-		return ""
-	}
-	if string(b) == "null" {
-		return ""
-	}
-	return string(b)
+func repoIDKey(repoID int64) string {
+	return fmt.Sprintf("id:%d", repoID)
 }
 
-func stringifyAny(v interface{}) string {
-	if v == nil {
-		return ""
+func isIgnoredRepoName(name string) bool {
+	return strings.EqualFold(strings.TrimSpace(name), ".github")
+}
+
+func extractImmerseCustomProperties(customProps map[string]any) (string, string, interface{}, []string) {
+	if customProps == nil {
+		return "", "", nil, nil
 	}
+	askID := toTrimmedString(customProps["immerse_ask_id"])
+	jfrogProjectKey := toTrimmedString(customProps["immerse_jfrog_project_key"])
+	sastCompliant := parseBoolish(customProps["immerse_sast_compliant"])
+	scanners := parseStringList(customProps["immerse_sast_scanners"])
+	return askID, jfrogProjectKey, sastCompliant, scanners
+}
+
+func upsertRepoSASTScanners(db *sql.DB, repoID int64, scanners []string) error {
+	if _, err := db.Exec(`DELETE FROM repo_sast_scanners WHERE repo_id = ?`, repoID); err != nil {
+		return err
+	}
+	for _, scanner := range scanners {
+		if _, err := db.Exec(`
+			INSERT OR IGNORE INTO repo_sast_scanners(repo_id, scanner)
+			VALUES (?, ?)
+		`, repoID, scanner); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func toTrimmedString(v any) string {
 	switch x := v.(type) {
+	case nil:
+		return ""
 	case string:
-		return x
+		return strings.TrimSpace(x)
+	case fmt.Stringer:
+		return strings.TrimSpace(x.String())
 	default:
-		return fmt.Sprintf("%v", x)
+		return strings.TrimSpace(fmt.Sprintf("%v", x))
 	}
 }
 
-func stringValue[T ~string](v *T) string {
-	if v == nil {
-		return ""
+func parseBoolish(v any) interface{} {
+	switch x := v.(type) {
+	case nil:
+		return nil
+	case bool:
+		return boolToInt(x)
+	case string:
+		s := strings.TrimSpace(strings.ToLower(x))
+		if s == "true" {
+			return 1
+		}
+		if s == "false" {
+			return 0
+		}
+	case float64:
+		if x == 1 {
+			return 1
+		}
+		if x == 0 {
+			return 0
+		}
+	case int:
+		if x == 1 {
+			return 1
+		}
+		if x == 0 {
+			return 0
+		}
 	}
-	return string(*v)
+	return nil
+}
+
+func parseStringList(v any) []string {
+	out := make([]string, 0)
+	seen := make(map[string]struct{})
+	appendVal := func(value string) {
+		s := strings.TrimSpace(value)
+		if s == "" {
+			return
+		}
+		if _, ok := seen[s]; ok {
+			return
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+
+	switch x := v.(type) {
+	case nil:
+	case string:
+		appendVal(x)
+	case []string:
+		for _, item := range x {
+			appendVal(item)
+		}
+	case []interface{}:
+		for _, item := range x {
+			appendVal(toTrimmedString(item))
+		}
+	default:
+		appendVal(fmt.Sprintf("%v", x))
+	}
+	return out
 }
 
 func stringifyDBValue(v interface{}) string {
