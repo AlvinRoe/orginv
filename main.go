@@ -1019,7 +1019,7 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 	}
 
 	packageVersionBySPDX := make(map[string]int64, len(doc.Packages))
-	for _, pkg := range doc.Packages {
+	for i, pkg := range doc.Packages {
 		if pkg == nil {
 			continue
 		}
@@ -1028,9 +1028,13 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 		if ecosystem == "" {
 			ecosystem = "unknown"
 		}
-		packageID, err := upsertPackageTx(tx, ecosystem, pkg.GetName())
+		packageName := strings.TrimSpace(pkg.GetName())
+		if packageName == "" {
+			packageName = firstNonEmpty(strings.TrimSpace(purl), strings.TrimSpace(pkg.GetSPDXID()), fmt.Sprintf("unnamed-package-%d", i+1))
+		}
+		packageID, err := upsertPackageTx(tx, ecosystem, packageName)
 		if err != nil {
-			return err
+			return fmt.Errorf("sbom package upsert failed (repo_id=%d spdx=%q name=%q): %w", repoID, pkg.GetSPDXID(), packageName, err)
 		}
 		packageVersionID, err := upsertPackageVersionTx(
 			tx,
@@ -1044,15 +1048,20 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 			boolPtrToIntPtr(pkg.FilesAnalyzed),
 		)
 		if err != nil {
-			return err
+			return fmt.Errorf("sbom package version upsert failed (repo_id=%d spdx=%q package_id=%d name=%q version=%q purl=%q): %w", repoID, pkg.GetSPDXID(), packageID, packageName, pkg.GetVersionInfo(), purl, err)
 		}
-		packageVersionBySPDX[pkg.GetSPDXID()] = packageVersionID
+		if packageVersionID == 0 {
+			return fmt.Errorf("sbom package version id is zero (repo_id=%d spdx=%q package_id=%d name=%q version=%q purl=%q)", repoID, pkg.GetSPDXID(), packageID, packageName, pkg.GetVersionInfo(), purl)
+		}
+		if spdxID := strings.TrimSpace(pkg.GetSPDXID()); spdxID != "" {
+			packageVersionBySPDX[spdxID] = packageVersionID
+		}
 		if _, err := tx.Exec(`
 				INSERT INTO repo_package_versions(repo_id, package_version_id, source)
 				VALUES (?, ?, 'sbom')
 				ON CONFLICT(repo_id, package_version_id, source) DO NOTHING
 			`, repoID, packageVersionID); err != nil {
-			return err
+			return fmt.Errorf("sbom repo_package_versions insert failed (repo_id=%d package_version_id=%d): %w", repoID, packageVersionID, err)
 		}
 
 		if _, err := tx.Exec(`
@@ -1067,24 +1076,24 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 					download_location = excluded.download_location,
 					files_analyzed = excluded.files_analyzed
 			`, sbomID, pkg.GetSPDXID(), packageVersionID, pkg.GetLicenseConcluded(), pkg.GetLicenseDeclared(), pkg.GetDownloadLocation(), boolPtrToIntPtr(pkg.FilesAnalyzed)); err != nil {
-			return err
+			return fmt.Errorf("sbom document package insert failed (repo_id=%d sbom_id=%d spdx=%q package_version_id=%d): %w", repoID, sbomID, pkg.GetSPDXID(), packageVersionID, err)
 		}
 
 		for _, ref := range pkg.ExternalRefs {
 			if ref == nil {
 				continue
 			}
-			_, err := tx.Exec(`
-					INSERT INTO sbom_package_external_refs(
-						sbom_id, spdx_package_id, reference_category, reference_type, reference_locator
-					) VALUES (?, ?, ?, ?, ?)
-					ON CONFLICT DO NOTHING
-				`, sbomID, pkg.GetSPDXID(), ref.ReferenceCategory, ref.ReferenceType, ref.ReferenceLocator)
-			if err != nil {
-				return err
+				_, err := tx.Exec(`
+						INSERT INTO sbom_package_external_refs(
+							sbom_id, spdx_package_id, reference_category, reference_type, reference_locator
+						) VALUES (?, ?, ?, ?, ?)
+						ON CONFLICT DO NOTHING
+					`, sbomID, pkg.GetSPDXID(), ref.ReferenceCategory, ref.ReferenceType, ref.ReferenceLocator)
+				if err != nil {
+					return fmt.Errorf("sbom external ref insert failed (repo_id=%d sbom_id=%d spdx=%q ref_type=%q locator=%q): %w", repoID, sbomID, pkg.GetSPDXID(), ref.ReferenceType, ref.ReferenceLocator, err)
+				}
 			}
 		}
-	}
 
 	for _, rel := range doc.Relationships {
 		if rel == nil {
@@ -1103,7 +1112,7 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 			ON CONFLICT DO NOTHING
 		`, sbomID, nullableInt64(okFrom, fromID), nullableInt64(okTo, toID), rel.RelationshipType, rel.SPDXElementID, rel.RelatedSPDXElement)
 		if err != nil {
-			return err
+			return fmt.Errorf("sbom relationship insert failed (repo_id=%d sbom_id=%d from_spdx=%q to_spdx=%q from_pkg_ver_id=%v to_pkg_ver_id=%v): %w", repoID, sbomID, rel.SPDXElementID, rel.RelatedSPDXElement, nullableInt64(okFrom, fromID), nullableInt64(okTo, toID), err)
 		}
 	}
 
