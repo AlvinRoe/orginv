@@ -1156,6 +1156,9 @@ func upsertPackageVersionTx(tx *sql.Tx, packageID int64, version, purl, license,
 	if packageID == 0 {
 		return 0, nil
 	}
+	if err := ensurePackageExistsTx(tx, packageID); err != nil {
+		return 0, err
+	}
 	_, err := tx.Exec(`
 		INSERT INTO package_versions(
 			package_id, version, purl, license, supplier, license_declared, download_location, files_analyzed
@@ -1190,6 +1193,25 @@ func upsertPackageVersionTx(tx *sql.Tx, packageID int64, version, purl, license,
 		return 0, err
 	}
 	return packageVersionID, nil
+}
+
+func ensurePackageExistsTx(tx *sql.Tx, packageID int64) error {
+	var exists int
+	err := tx.QueryRow(`SELECT 1 FROM packages WHERE package_id = ? LIMIT 1`, packageID).Scan(&exists)
+	if err == nil {
+		return nil
+	}
+	if err != sql.ErrNoRows {
+		return err
+	}
+	_, err = tx.Exec(`
+		INSERT INTO packages(package_id, ecosystem, name)
+		VALUES (?, 'unknown', ?)
+	`, packageID, fmt.Sprintf("recovered-package-%d", packageID))
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func fetchDependabotAlerts(ctx context.Context, client *github.Client, org string, perPage int) ([]*github.DependabotAlert, int, error) {
