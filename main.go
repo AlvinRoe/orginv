@@ -1086,13 +1086,8 @@ func upsertPackageTx(tx *sql.Tx, ecosystem, name, version, purl, license, suppli
 	if err != nil {
 		return 0, err
 	}
-	packageID, err := res.LastInsertId()
-	if err != nil {
-		return 0, err
-	}
-	if packageID != 0 {
-		return packageID, nil
-	}
+	_, _ = res.RowsAffected()
+	var packageID int64
 	if err := tx.QueryRow(`
 		SELECT package_id FROM packages
 		WHERE ecosystem = ? AND name = ? AND version = ? AND purl = ?
