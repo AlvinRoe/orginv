@@ -1428,19 +1428,12 @@ func ingestCodeScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts 
 			skippedRepo++
 			continue
 		}
-		toolID, err := upsertCodeScanningToolTx(tx, a.GetTool())
-		if err != nil {
-			return err
-		}
-		ruleID, err := upsertCodeScanningRuleTx(tx, toolID, a.GetRule(), a.GetRuleID(), a.GetRuleDescription(), a.GetRuleSeverity())
-		if err != nil {
-			return err
-		}
+		var ruleID interface{} = nil
 		_, err = stmt.Exec(
 			repoID,
 			a.GetNumber(),
 			a.GetState(),
-			nullableInt64Value(ruleID),
+			ruleID,
 			a.GetRuleSeverity(),
 			formatGitHubTimePtr(a.CreatedAt),
 			formatGitHubTimePtr(a.FixedAt),
@@ -1457,9 +1450,6 @@ func ingestCodeScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts 
 			return err
 		}
 		if err := upsertCodeScanningAlertInstanceTx(tx, repoID, a.GetNumber(), a.GetMostRecentInstance()); err != nil {
-			return err
-		}
-		if err := upsertCodeScanningRuleTagsTx(tx, ruleID, a.GetRule()); err != nil {
 			return err
 		}
 		inserted++
