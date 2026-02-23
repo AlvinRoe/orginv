@@ -514,8 +514,7 @@ func initSQLite(db *sql.DB) error {
 			dismissed_comment TEXT,
 			auto_dismissed_at TEXT,
 			dependency_scope TEXT,
-			PRIMARY KEY (repo_id, alert_number),
-			FOREIGN KEY(package_id) REFERENCES packages(package_id)
+			PRIMARY KEY (repo_id, alert_number)
 		);`,
 		`CREATE TABLE IF NOT EXISTS security_advisories (
 			advisory_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -546,8 +545,7 @@ func initSQLite(db *sql.DB) error {
 			severity TEXT,
 			vulnerable_version_range TEXT,
 			first_patched_version TEXT,
-			PRIMARY KEY (advisory_id, row_num),
-			FOREIGN KEY(package_id) REFERENCES packages(package_id)
+			PRIMARY KEY (advisory_id, row_num)
 		);`,
 		`CREATE TABLE IF NOT EXISTS advisory_identifiers (
 			identifier_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -615,8 +613,7 @@ func initSQLite(db *sql.DB) error {
 			dismissed_at TEXT,
 			dismissed_reason TEXT,
 			dismissed_comment TEXT,
-			PRIMARY KEY (repo_id, alert_number),
-			FOREIGN KEY(rule_id) REFERENCES code_scanning_rules(rule_id)
+			PRIMARY KEY (repo_id, alert_number)
 		);`,
 		`CREATE TABLE IF NOT EXISTS code_scanning_alert_instances (
 			repo_id INTEGER NOT NULL,
@@ -1622,7 +1619,7 @@ func ingestSecretScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alert
 			push_protection_bypassed,
 			push_protection_bypassed_at, resolution_comment, push_protection_bypass_request_comment,
 			push_protection_bypass_request_html_url, validity, has_more_locations
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(repo_id, alert_number) DO UPDATE SET
 			state = excluded.state,
 			secret_type = excluded.secret_type,
