@@ -428,11 +428,6 @@ func initSQLite(db *sql.DB) error {
 			package_id INTEGER PRIMARY KEY AUTOINCREMENT,
 			ecosystem TEXT NOT NULL DEFAULT '',
 			name TEXT NOT NULL DEFAULT '',
-			UNIQUE (ecosystem, name)
-		);`,
-		`CREATE TABLE IF NOT EXISTS package_versions (
-			package_version_id INTEGER PRIMARY KEY AUTOINCREMENT,
-			package_id INTEGER NOT NULL,
 			version TEXT NOT NULL DEFAULT '',
 			purl TEXT NOT NULL DEFAULT '',
 			license TEXT,
@@ -440,15 +435,14 @@ func initSQLite(db *sql.DB) error {
 			license_declared TEXT,
 			download_location TEXT,
 			files_analyzed INTEGER,
-			UNIQUE (package_id, version, purl),
-			FOREIGN KEY(package_id) REFERENCES packages(package_id)
+			UNIQUE (ecosystem, name, version, purl)
 		);`,
-		`CREATE TABLE IF NOT EXISTS repo_package_versions (
+		`CREATE TABLE IF NOT EXISTS repo_packages (
 			repo_id INTEGER NOT NULL,
-			package_version_id INTEGER NOT NULL,
+			package_id INTEGER NOT NULL,
 			source TEXT NOT NULL,
-			PRIMARY KEY (repo_id, package_version_id, source),
-			FOREIGN KEY(package_version_id) REFERENCES package_versions(package_version_id)
+			PRIMARY KEY (repo_id, package_id, source),
+			FOREIGN KEY(package_id) REFERENCES packages(package_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS sbom_documents (
 			sbom_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -467,14 +461,14 @@ func initSQLite(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS sbom_document_packages (
 			sbom_id INTEGER NOT NULL,
 			spdx_package_id TEXT NOT NULL,
-			package_version_id INTEGER,
+			package_id INTEGER,
 			license_concluded TEXT,
 			license_declared TEXT,
 			download_location TEXT,
 			files_analyzed INTEGER,
 			PRIMARY KEY (sbom_id, spdx_package_id),
 			FOREIGN KEY(sbom_id) REFERENCES sbom_documents(sbom_id),
-			FOREIGN KEY(package_version_id) REFERENCES package_versions(package_version_id)
+			FOREIGN KEY(package_id) REFERENCES packages(package_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS sbom_package_external_refs (
 			sbom_id INTEGER NOT NULL,
@@ -486,15 +480,15 @@ func initSQLite(db *sql.DB) error {
 		);`,
 		`CREATE TABLE IF NOT EXISTS sbom_relationships (
 			sbom_id INTEGER NOT NULL,
-			from_package_version_id INTEGER,
-			to_package_version_id INTEGER,
+			from_package_id INTEGER,
+			to_package_id INTEGER,
 			relationship_type TEXT NOT NULL,
 			from_spdx_id TEXT,
 			to_spdx_id TEXT,
 			PRIMARY KEY (sbom_id, from_spdx_id, to_spdx_id, relationship_type),
 			FOREIGN KEY(sbom_id) REFERENCES sbom_documents(sbom_id),
-			FOREIGN KEY(from_package_version_id) REFERENCES package_versions(package_version_id),
-			FOREIGN KEY(to_package_version_id) REFERENCES package_versions(package_version_id)
+			FOREIGN KEY(from_package_id) REFERENCES packages(package_id),
+			FOREIGN KEY(to_package_id) REFERENCES packages(package_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS dependabot_alerts (
 			repo_id INTEGER NOT NULL,
@@ -540,23 +534,12 @@ func initSQLite(db *sql.DB) error {
 		);`,
 		`CREATE TABLE IF NOT EXISTS security_advisory_vulnerabilities (
 			advisory_id INTEGER NOT NULL,
-			row_num INTEGER NOT NULL,
-			package_id INTEGER,
+			package_key_id INTEGER NOT NULL,
+			package_ordinal INTEGER NOT NULL,
 			severity TEXT,
 			vulnerable_version_range TEXT,
 			first_patched_version TEXT,
-			PRIMARY KEY (advisory_id, row_num)
-		);`,
-		`CREATE TABLE IF NOT EXISTS advisory_identifiers (
-			identifier_id INTEGER PRIMARY KEY AUTOINCREMENT,
-			type TEXT NOT NULL,
-			value TEXT NOT NULL,
-			UNIQUE (type, value)
-		);`,
-		`CREATE TABLE IF NOT EXISTS security_advisory_identifiers (
-			advisory_id INTEGER NOT NULL,
-			identifier_id INTEGER NOT NULL,
-			PRIMARY KEY (advisory_id, identifier_id)
+			PRIMARY KEY (advisory_id, package_key_id, package_ordinal)
 		);`,
 		`CREATE TABLE IF NOT EXISTS advisory_references (
 			reference_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -577,31 +560,10 @@ func initSQLite(db *sql.DB) error {
 			cwe_id TEXT NOT NULL,
 			PRIMARY KEY (advisory_id, cwe_id)
 		);`,
-		`CREATE TABLE IF NOT EXISTS code_scanning_tools (
-			tool_id INTEGER PRIMARY KEY AUTOINCREMENT,
-			name TEXT,
-			guid TEXT,
-			version TEXT,
-			UNIQUE (name, guid, version)
-		);`,
-		`CREATE TABLE IF NOT EXISTS code_scanning_rules (
-			rule_id INTEGER PRIMARY KEY AUTOINCREMENT,
-			external_rule_id TEXT,
-			tool_id INTEGER,
-			name TEXT,
-			description TEXT,
-			full_description TEXT,
-			help TEXT,
-			severity TEXT,
-			security_severity TEXT,
-			UNIQUE (external_rule_id, tool_id),
-			FOREIGN KEY(tool_id) REFERENCES code_scanning_tools(tool_id)
-		);`,
 		`CREATE TABLE IF NOT EXISTS code_scanning_alerts (
 			repo_id INTEGER NOT NULL,
 			alert_number INTEGER NOT NULL,
 			state TEXT,
-			rule_id INTEGER,
 			severity TEXT,
 			created_at TEXT,
 			fixed_at TEXT,
@@ -632,15 +594,6 @@ func initSQLite(db *sql.DB) error {
 			analysis_key TEXT,
 			environment TEXT,
 			PRIMARY KEY (repo_id, alert_number, ordinal)
-		);`,
-		`CREATE TABLE IF NOT EXISTS code_scanning_tags (
-			tag_id INTEGER PRIMARY KEY AUTOINCREMENT,
-			tag TEXT NOT NULL UNIQUE
-		);`,
-		`CREATE TABLE IF NOT EXISTS code_scanning_rule_tags (
-			rule_id INTEGER NOT NULL,
-			tag_id INTEGER NOT NULL,
-			PRIMARY KEY (rule_id, tag_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS secret_scanning_alerts (
 			repo_id INTEGER NOT NULL,
@@ -720,6 +673,7 @@ func applySchemaMigrations(db *sql.DB) error {
 		"sbom_document_packages",
 		"sbom_document_describes",
 		"sbom_documents",
+		"repo_packages",
 		"repo_package_versions",
 		"package_versions",
 		"packages",
@@ -1015,7 +969,7 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 		return err
 	}
 
-	packageVersionBySPDX := make(map[string]int64, len(doc.Packages))
+	packageBySPDX := make(map[string]int64, len(doc.Packages))
 	for i, pkg := range doc.Packages {
 		if pkg == nil {
 			continue
@@ -1029,96 +983,95 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 		if packageName == "" {
 			packageName = firstNonEmpty(strings.TrimSpace(purl), strings.TrimSpace(pkg.GetSPDXID()), fmt.Sprintf("unnamed-package-%d", i+1))
 		}
-		packageID, err := upsertPackageTx(tx, ecosystem, packageName)
-		if err != nil {
-			return fmt.Errorf("sbom package upsert failed (repo_id=%d spdx=%q name=%q): %w", repoID, pkg.GetSPDXID(), packageName, err)
-		}
-		packageVersionID, err := upsertPackageVersionTx(
+		packageID, err := upsertPackageTx(
 			tx,
-			packageID,
+			ecosystem,
+			packageName,
 			pkg.GetVersionInfo(),
 			purl,
-			pkg.GetLicenseConcluded(),
+			"",
 			"",
 			pkg.GetLicenseDeclared(),
 			pkg.GetDownloadLocation(),
 			boolPtrToIntPtr(pkg.FilesAnalyzed),
 		)
 		if err != nil {
-			return fmt.Errorf("sbom package version upsert failed (repo_id=%d spdx=%q package_id=%d name=%q version=%q purl=%q): %w", repoID, pkg.GetSPDXID(), packageID, packageName, pkg.GetVersionInfo(), purl, err)
+			return fmt.Errorf("sbom package upsert failed (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q): %w", repoID, pkg.GetSPDXID(), ecosystem, packageName, pkg.GetVersionInfo(), purl, err)
 		}
-		if packageVersionID == 0 {
-			return fmt.Errorf("sbom package version id is zero (repo_id=%d spdx=%q package_id=%d name=%q version=%q purl=%q)", repoID, pkg.GetSPDXID(), packageID, packageName, pkg.GetVersionInfo(), purl)
+		if packageID == 0 {
+			return fmt.Errorf("sbom package id is zero (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q)", repoID, pkg.GetSPDXID(), ecosystem, packageName, pkg.GetVersionInfo(), purl)
 		}
 		if spdxID := strings.TrimSpace(pkg.GetSPDXID()); spdxID != "" {
-			packageVersionBySPDX[spdxID] = packageVersionID
+			packageBySPDX[spdxID] = packageID
 		}
 		if _, err := tx.Exec(`
-				INSERT INTO repo_package_versions(repo_id, package_version_id, source)
+				INSERT INTO repo_packages(repo_id, package_id, source)
 				VALUES (?, ?, 'sbom')
-				ON CONFLICT(repo_id, package_version_id, source) DO NOTHING
-			`, repoID, packageVersionID); err != nil {
-			return fmt.Errorf("sbom repo_package_versions insert failed (repo_id=%d package_version_id=%d): %w", repoID, packageVersionID, err)
+				ON CONFLICT(repo_id, package_id, source) DO NOTHING
+			`, repoID, packageID); err != nil {
+			return fmt.Errorf("sbom repo_packages insert failed (repo_id=%d package_id=%d): %w", repoID, packageID, err)
 		}
 
 		if _, err := tx.Exec(`
 				INSERT INTO sbom_document_packages(
-					sbom_id, spdx_package_id, package_version_id, license_concluded, license_declared, download_location, files_analyzed
+					sbom_id, spdx_package_id, package_id, license_concluded, license_declared, download_location, files_analyzed
 				)
 				VALUES (?, ?, ?, ?, ?, ?, ?)
 				ON CONFLICT(sbom_id, spdx_package_id) DO UPDATE SET
-					package_version_id = excluded.package_version_id,
+					package_id = excluded.package_id,
 					license_concluded = excluded.license_concluded,
 					license_declared = excluded.license_declared,
 					download_location = excluded.download_location,
 					files_analyzed = excluded.files_analyzed
-			`, sbomID, pkg.GetSPDXID(), packageVersionID, pkg.GetLicenseConcluded(), pkg.GetLicenseDeclared(), pkg.GetDownloadLocation(), boolPtrToIntPtr(pkg.FilesAnalyzed)); err != nil {
-			return fmt.Errorf("sbom document package insert failed (repo_id=%d sbom_id=%d spdx=%q package_version_id=%d): %w", repoID, sbomID, pkg.GetSPDXID(), packageVersionID, err)
+			`, sbomID, pkg.GetSPDXID(), packageID, pkg.GetLicenseConcluded(), pkg.GetLicenseDeclared(), pkg.GetDownloadLocation(), boolPtrToIntPtr(pkg.FilesAnalyzed)); err != nil {
+			return fmt.Errorf("sbom document package insert failed (repo_id=%d sbom_id=%d spdx=%q package_id=%d): %w", repoID, sbomID, pkg.GetSPDXID(), packageID, err)
 		}
 
 		for _, ref := range pkg.ExternalRefs {
 			if ref == nil {
 				continue
 			}
-				_, err := tx.Exec(`
+			_, err := tx.Exec(`
 						INSERT INTO sbom_package_external_refs(
 							sbom_id, spdx_package_id, reference_category, reference_type, reference_locator
 						) VALUES (?, ?, ?, ?, ?)
 						ON CONFLICT DO NOTHING
 					`, sbomID, pkg.GetSPDXID(), ref.ReferenceCategory, ref.ReferenceType, ref.ReferenceLocator)
-				if err != nil {
-					return fmt.Errorf("sbom external ref insert failed (repo_id=%d sbom_id=%d spdx=%q ref_type=%q locator=%q): %w", repoID, sbomID, pkg.GetSPDXID(), ref.ReferenceType, ref.ReferenceLocator, err)
-				}
+			if err != nil {
+				return fmt.Errorf("sbom external ref insert failed (repo_id=%d sbom_id=%d spdx=%q ref_type=%q locator=%q): %w", repoID, sbomID, pkg.GetSPDXID(), ref.ReferenceType, ref.ReferenceLocator, err)
 			}
 		}
+	}
 
 	for _, rel := range doc.Relationships {
 		if rel == nil {
 			continue
 		}
-		fromID, okFrom := packageVersionBySPDX[rel.SPDXElementID]
-		toID, okTo := packageVersionBySPDX[rel.RelatedSPDXElement]
+		fromID, okFrom := packageBySPDX[rel.SPDXElementID]
+		toID, okTo := packageBySPDX[rel.RelatedSPDXElement]
 		if !okFrom && !okTo {
 			continue
 		}
 		_, err := tx.Exec(`
 			INSERT INTO sbom_relationships(
-				sbom_id, from_package_version_id, to_package_version_id, relationship_type, from_spdx_id, to_spdx_id
+				sbom_id, from_package_id, to_package_id, relationship_type, from_spdx_id, to_spdx_id
 			)
 			VALUES (?, ?, ?, ?, ?, ?)
 			ON CONFLICT DO NOTHING
 		`, sbomID, nullableInt64(okFrom, fromID), nullableInt64(okTo, toID), rel.RelationshipType, rel.SPDXElementID, rel.RelatedSPDXElement)
 		if err != nil {
-			return fmt.Errorf("sbom relationship insert failed (repo_id=%d sbom_id=%d from_spdx=%q to_spdx=%q from_pkg_ver_id=%v to_pkg_ver_id=%v): %w", repoID, sbomID, rel.SPDXElementID, rel.RelatedSPDXElement, nullableInt64(okFrom, fromID), nullableInt64(okTo, toID), err)
+			return fmt.Errorf("sbom relationship insert failed (repo_id=%d sbom_id=%d from_spdx=%q to_spdx=%q from_package_id=%v to_package_id=%v): %w", repoID, sbomID, rel.SPDXElementID, rel.RelatedSPDXElement, nullableInt64(okFrom, fromID), nullableInt64(okTo, toID), err)
 		}
 	}
 
 	return tx.Commit()
 }
 
-func upsertPackageTx(tx *sql.Tx, ecosystem, name string) (int64, error) {
+func upsertPackageTx(tx *sql.Tx, ecosystem, name, version, purl, license, supplier, licenseDeclared, downloadLocation string, filesAnalyzed interface{}) (int64, error) {
 	ecosystem = safeStr(ecosystem)
 	name = safeStr(name)
+	version = safeStr(version)
+	purl = safeStr(purl)
 	if ecosystem == "" {
 		ecosystem = "unknown"
 	}
@@ -1126,10 +1079,10 @@ func upsertPackageTx(tx *sql.Tx, ecosystem, name string) (int64, error) {
 		return 0, nil
 	}
 	res, err := tx.Exec(`
-		INSERT INTO packages(ecosystem, name)
-		VALUES (?, ?)
-		ON CONFLICT(ecosystem, name) DO NOTHING
-	`, ecosystem, name)
+		INSERT INTO packages(ecosystem, name, version, purl, license, supplier, license_declared, download_location, files_analyzed)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(ecosystem, name, version, purl) DO NOTHING
+	`, ecosystem, name, version, purl, license, supplier, licenseDeclared, downloadLocation, filesAnalyzed)
 	if err != nil {
 		return 0, err
 	}
@@ -1142,73 +1095,24 @@ func upsertPackageTx(tx *sql.Tx, ecosystem, name string) (int64, error) {
 	}
 	if err := tx.QueryRow(`
 		SELECT package_id FROM packages
-		WHERE ecosystem = ? AND name = ?
-	`, ecosystem, name).Scan(&packageID); err != nil {
+		WHERE ecosystem = ? AND name = ? AND version = ? AND purl = ?
+	`, ecosystem, name, version, purl).Scan(&packageID); err != nil {
 		return 0, err
 	}
-	return packageID, nil
-}
-
-func upsertPackageVersionTx(tx *sql.Tx, packageID int64, version, purl, license, supplier, licenseDeclared, downloadLocation string, filesAnalyzed interface{}) (int64, error) {
-	if packageID == 0 {
-		return 0, nil
-	}
-	if err := ensurePackageExistsTx(tx, packageID); err != nil {
-		return 0, err
-	}
-	_, err := tx.Exec(`
-		INSERT INTO package_versions(
-			package_id, version, purl, license, supplier, license_declared, download_location, files_analyzed
-		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(package_id, version, purl) DO NOTHING
-	`, packageID, safeStr(version), safeStr(purl), license, supplier, licenseDeclared, downloadLocation, filesAnalyzed)
-	if err != nil {
-		return 0, err
-	}
-
-	var packageVersionID int64
-	err = tx.QueryRow(`
-		SELECT package_version_id FROM package_versions
-		WHERE package_id = ? AND version = ? AND purl = ?
-	`, packageID, safeStr(version), safeStr(purl)).Scan(&packageVersionID)
-	if err != nil {
-		return 0, err
-	}
-
 	_, err = tx.Exec(`
-		UPDATE package_versions
+		UPDATE packages
 		SET
 			license = COALESCE(NULLIF(?, ''), license),
 			supplier = COALESCE(NULLIF(?, ''), supplier),
 			license_declared = COALESCE(NULLIF(?, ''), license_declared),
 			download_location = COALESCE(NULLIF(?, ''), download_location),
 			files_analyzed = COALESCE(?, files_analyzed)
-		WHERE package_version_id = ?
-	`, license, supplier, licenseDeclared, downloadLocation, filesAnalyzed, packageVersionID)
+		WHERE package_id = ?
+	`, license, supplier, licenseDeclared, downloadLocation, filesAnalyzed, packageID)
 	if err != nil {
 		return 0, err
 	}
-	return packageVersionID, nil
-}
-
-func ensurePackageExistsTx(tx *sql.Tx, packageID int64) error {
-	var exists int
-	err := tx.QueryRow(`SELECT 1 FROM packages WHERE package_id = ? LIMIT 1`, packageID).Scan(&exists)
-	if err == nil {
-		return nil
-	}
-	if err != sql.ErrNoRows {
-		return err
-	}
-	_, err = tx.Exec(`
-		INSERT INTO packages(package_id, ecosystem, name)
-		VALUES (?, 'unknown', ?)
-	`, packageID, fmt.Sprintf("recovered-package-%d", packageID))
-	if err != nil {
-		return err
-	}
-	return nil
+	return packageID, nil
 }
 
 func fetchDependabotAlerts(ctx context.Context, client *github.Client, org string, perPage int) ([]*github.DependabotAlert, int, error) {
@@ -1309,7 +1213,7 @@ func ingestDependabotAlerts(db *sql.DB, repoIDByName map[string]int64, alerts []
 		pkgName := firstNonEmpty(depPackage.GetName(), secPackage.GetName())
 		severity := strings.ToLower(firstNonEmpty(securityVuln.GetSeverity(), securityAdv.GetSeverity()))
 
-		packageID, depErr := upsertPackageTx(tx, ecosystem, pkgName)
+		packageID, depErr := upsertPackageTx(tx, ecosystem, pkgName, "", "", "", "", "", "", nil)
 		if depErr != nil {
 			return depErr
 		}
@@ -1394,12 +1298,11 @@ func ingestCodeScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts 
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO code_scanning_alerts(
-			repo_id, alert_number, state, rule_id, severity,
+			repo_id, alert_number, state, severity,
 			created_at, fixed_at, updated_at, closed_at, url, html_url, instances_url, dismissed_at, dismissed_reason, dismissed_comment
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(repo_id, alert_number) DO UPDATE SET
 			state = excluded.state,
-			rule_id = excluded.rule_id,
 			severity = excluded.severity,
 			created_at = excluded.created_at,
 			fixed_at = excluded.fixed_at,
@@ -1428,12 +1331,10 @@ func ingestCodeScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts 
 			skippedRepo++
 			continue
 		}
-		var ruleID interface{} = nil
 		_, err = stmt.Exec(
 			repoID,
 			a.GetNumber(),
 			a.GetState(),
-			ruleID,
 			a.GetRuleSeverity(),
 			formatGitHubTimePtr(a.CreatedAt),
 			formatGitHubTimePtr(a.FixedAt),
@@ -1457,85 +1358,6 @@ func ingestCodeScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts 
 	log.Printf("code scanning ingest summary: total=%d inserted=%d skipped_repo=%d", len(alerts), inserted, skippedRepo)
 
 	return tx.Commit()
-}
-
-func upsertCodeScanningToolTx(tx *sql.Tx, tool *github.Tool) (int64, error) {
-	if tool == nil {
-		return 0, nil
-	}
-	name := strings.TrimSpace(tool.GetName())
-	guid := strings.TrimSpace(tool.GetGUID())
-	version := strings.TrimSpace(tool.GetVersion())
-	res, err := tx.Exec(`
-		INSERT INTO code_scanning_tools(name, guid, version)
-		VALUES (?, ?, ?)
-		ON CONFLICT(name, guid, version) DO NOTHING
-	`, name, guid, version)
-	if err != nil {
-		return 0, err
-	}
-	toolID, err := res.LastInsertId()
-	if err != nil {
-		return 0, err
-	}
-	if toolID != 0 {
-		return toolID, nil
-	}
-	if err := tx.QueryRow(`
-		SELECT tool_id FROM code_scanning_tools
-		WHERE name = ? AND guid = ? AND version = ?
-	`, name, guid, version).Scan(&toolID); err != nil {
-		return 0, err
-	}
-	return toolID, nil
-}
-
-func upsertCodeScanningRuleTx(tx *sql.Tx, toolID int64, rule *github.Rule, fallbackID, fallbackDescription, fallbackSeverity string) (int64, error) {
-	if rule == nil && strings.TrimSpace(fallbackID) == "" && strings.TrimSpace(fallbackDescription) == "" && strings.TrimSpace(fallbackSeverity) == "" {
-		return 0, nil
-	}
-	externalRuleID := safeStr(fallbackID)
-	name := ""
-	description := safeStr(fallbackDescription)
-	fullDescription := ""
-	help := ""
-	severity := safeStr(fallbackSeverity)
-	securitySeverity := ""
-	if rule != nil {
-		externalRuleID = firstNonEmpty(rule.GetID(), externalRuleID)
-		name = rule.GetName()
-		description = firstNonEmpty(rule.GetDescription(), description)
-		fullDescription = rule.GetFullDescription()
-		help = rule.GetHelp()
-		severity = firstNonEmpty(rule.GetSeverity(), severity)
-		securitySeverity = rule.GetSecuritySeverityLevel()
-	}
-	toolIDVal := nullableInt64Value(toolID)
-	_, err := tx.Exec(`
-		INSERT INTO code_scanning_rules(
-			external_rule_id, tool_id, name, description, full_description, help, severity, security_severity
-		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(external_rule_id, tool_id) DO UPDATE SET
-			name = COALESCE(NULLIF(excluded.name, ''), code_scanning_rules.name),
-			description = COALESCE(NULLIF(excluded.description, ''), code_scanning_rules.description),
-			full_description = COALESCE(NULLIF(excluded.full_description, ''), code_scanning_rules.full_description),
-			help = COALESCE(NULLIF(excluded.help, ''), code_scanning_rules.help),
-			severity = COALESCE(NULLIF(excluded.severity, ''), code_scanning_rules.severity),
-			security_severity = COALESCE(NULLIF(excluded.security_severity, ''), code_scanning_rules.security_severity)
-	`, externalRuleID, toolIDVal, name, description, fullDescription, help, severity, securitySeverity)
-	if err != nil {
-		return 0, err
-	}
-	var ruleID int64
-	if err := tx.QueryRow(`
-		SELECT rule_id FROM code_scanning_rules
-		WHERE external_rule_id = ? AND tool_id IS ?
-		LIMIT 1
-	`, externalRuleID, toolIDVal).Scan(&ruleID); err != nil {
-		return 0, err
-	}
-	return ruleID, nil
 }
 
 func upsertCodeScanningAlertInstanceTx(tx *sql.Tx, repoID int64, alertNumber int, inst *github.MostRecentInstance) error {
@@ -1730,7 +1552,6 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAl
 
 	for _, table := range []string{
 		"security_advisory_vulnerabilities",
-		"security_advisory_identifiers",
 		"security_advisory_references",
 		"security_advisory_cwes",
 	} {
@@ -1742,40 +1563,29 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAl
 		}
 	}
 
-	for i, v := range adv.Vulnerabilities {
+	packageOrdinals := make(map[int64]int)
+	for _, v := range adv.Vulnerabilities {
 		if v == nil {
 			continue
 		}
 		pkg := v.GetPackage()
-		packageID, err := upsertPackageTx(tx, pkg.GetEcosystem(), pkg.GetName())
+		packageID, err := upsertPackageTx(tx, pkg.GetEcosystem(), pkg.GetName(), "", "", "", "", "", "", nil)
 		if err != nil {
 			return err
 		}
+		packageKeyID := int64(-1)
+		if packageID != 0 {
+			packageKeyID = packageID
+		}
+		packageOrdinals[packageKeyID]++
+		packageOrdinal := packageOrdinals[packageKeyID]
 		_, err = tx.Exec(`
 				INSERT INTO security_advisory_vulnerabilities(
-					advisory_id, row_num, package_id, severity, vulnerable_version_range,
+					advisory_id, package_key_id, package_ordinal, severity, vulnerable_version_range,
 					first_patched_version
 				) VALUES (?, ?, ?, ?, ?, ?)
-			`, advisoryID, i+1, nullableInt64Value(packageID), v.GetSeverity(),
+			`, advisoryID, packageKeyID, packageOrdinal, v.GetSeverity(),
 			v.GetVulnerableVersionRange(), v.GetFirstPatchedVersion().GetIdentifier())
-		if err != nil {
-			return err
-		}
-	}
-
-	for _, id := range adv.Identifiers {
-		if id == nil {
-			continue
-		}
-		identifierID, err := upsertAdvisoryIdentifierTx(tx, id.GetType(), id.GetValue())
-		if err != nil {
-			return err
-		}
-		_, err = tx.Exec(`
-				INSERT INTO security_advisory_identifiers(advisory_id, identifier_id)
-				VALUES (?, ?)
-				ON CONFLICT(advisory_id, identifier_id) DO NOTHING
-			`, advisoryID, identifierID)
 		if err != nil {
 			return err
 		}
@@ -1901,36 +1711,6 @@ func upsertSecurityAdvisoryTx(tx *sql.Tx, adv *github.DependabotSecurityAdvisory
 	return res.LastInsertId()
 }
 
-func upsertAdvisoryIdentifierTx(tx *sql.Tx, identifierType, value string) (int64, error) {
-	identifierType = strings.TrimSpace(identifierType)
-	value = strings.TrimSpace(value)
-	if identifierType == "" || value == "" {
-		return 0, fmt.Errorf("dependabot identifier missing type or value")
-	}
-	res, err := tx.Exec(`
-		INSERT INTO advisory_identifiers(type, value)
-		VALUES (?, ?)
-		ON CONFLICT(type, value) DO NOTHING
-	`, identifierType, value)
-	if err != nil {
-		return 0, err
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return 0, err
-	}
-	if id != 0 {
-		return id, nil
-	}
-	if err := tx.QueryRow(`
-		SELECT identifier_id FROM advisory_identifiers
-		WHERE type = ? AND value = ?
-	`, identifierType, value).Scan(&id); err != nil {
-		return 0, err
-	}
-	return id, nil
-}
-
 func upsertAdvisoryReferenceTx(tx *sql.Tx, url string) (int64, error) {
 	url = strings.TrimSpace(url)
 	if url == "" {
@@ -1964,41 +1744,6 @@ func upsertCWETx(tx *sql.Tx, cweID, name string) error {
 		ON CONFLICT(cwe_id) DO UPDATE SET name = excluded.name
 	`, cweID, name)
 	return err
-}
-
-func upsertCodeScanningRuleTagsTx(tx *sql.Tx, ruleID int64, rule *github.Rule) error {
-	if ruleID == 0 || rule == nil {
-		return nil
-	}
-	if _, err := tx.Exec(`DELETE FROM code_scanning_rule_tags WHERE rule_id = ?`, ruleID); err != nil {
-		return err
-	}
-	for _, tag := range rule.Tags {
-		if strings.TrimSpace(tag) == "" {
-			continue
-		}
-		res, err := tx.Exec(`INSERT INTO code_scanning_tags(tag) VALUES (?) ON CONFLICT(tag) DO NOTHING`, tag)
-		if err != nil {
-			return err
-		}
-		tagID, err := res.LastInsertId()
-		if err != nil {
-			return err
-		}
-		if tagID == 0 {
-			if err := tx.QueryRow(`SELECT tag_id FROM code_scanning_tags WHERE tag = ?`, tag).Scan(&tagID); err != nil {
-				return err
-			}
-		}
-		if _, err := tx.Exec(`
-				INSERT INTO code_scanning_rule_tags(rule_id, tag_id)
-				VALUES (?, ?)
-				ON CONFLICT(rule_id, tag_id) DO NOTHING
-			`, ruleID, tagID); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func exportCSVReport(db *sql.DB, outputPath string) error {
@@ -2045,22 +1790,21 @@ func exportCSVReport(db *sql.DB, outputPath string) error {
 				(SELECT sd.document_describes_count FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_document_describes_count,
 				(SELECT sd.package_count FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_package_count,
 				(SELECT sd.relationship_count FROM sbom_documents sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_relationship_count,
-			(SELECT COUNT(1) FROM repo_package_versions rpv WHERE rpv.repo_id = r.repo_id) AS dependency_count,
+			(SELECT COUNT(1) FROM repo_packages rp WHERE rp.repo_id = r.repo_id) AS dependency_count,
 			(
 				SELECT COALESCE(group_concat(
-					'package_version_id=' || pv.package_version_id ||
+					'package_id=' || p.package_id ||
 					';ecosystem=' || COALESCE(p.ecosystem, '') ||
 					';name=' || COALESCE(p.name, '') ||
-					';version=' || COALESCE(pv.version, '') ||
-					';purl=' || COALESCE(pv.purl, '') ||
-					';license=' || COALESCE(pv.license, '') ||
-					';supplier=' || COALESCE(pv.supplier, ''),
+					';version=' || COALESCE(p.version, '') ||
+					';purl=' || COALESCE(p.purl, '') ||
+					';license=' || COALESCE(p.license, '') ||
+					';supplier=' || COALESCE(p.supplier, ''),
 					char(10)
 				), '')
-				FROM repo_package_versions rpv
-				JOIN package_versions pv ON pv.package_version_id = rpv.package_version_id
-				JOIN packages p ON p.package_id = pv.package_id
-				WHERE rpv.repo_id = r.repo_id
+				FROM repo_packages rp
+				JOIN packages p ON p.package_id = rp.package_id
+				WHERE rp.repo_id = r.repo_id
 			) AS dependency_details,
 			(SELECT COUNT(1) FROM dependabot_alerts da WHERE da.repo_id = r.repo_id AND lower(da.state) = 'open') AS open_dependabot_alerts,
 			(SELECT COUNT(1) FROM dependabot_alerts da WHERE da.repo_id = r.repo_id AND lower(da.state) = 'open' AND lower(da.severity) = 'critical') AS open_critical_dependabot_alerts,
@@ -2090,8 +1834,6 @@ func exportCSVReport(db *sql.DB, outputPath string) error {
 				SELECT COALESCE(group_concat(
 					'alert_number=' || ca.alert_number ||
 					';state=' || COALESCE(ca.state, '') ||
-					';rule=' || COALESCE(cr.external_rule_id, '') ||
-					';tool=' || COALESCE(ct.name, '') ||
 						';severity=' || COALESCE(ca.severity, '') ||
 						';created_at=' || COALESCE(ca.created_at, '') ||
 						';fixed_at=' || COALESCE(ca.fixed_at, '') ||
@@ -2102,8 +1844,6 @@ func exportCSVReport(db *sql.DB, outputPath string) error {
 						char(10)
 					), '')
 					FROM code_scanning_alerts ca
-					LEFT JOIN code_scanning_rules cr ON cr.rule_id = ca.rule_id
-					LEFT JOIN code_scanning_tools ct ON ct.tool_id = cr.tool_id
 					LEFT JOIN code_scanning_alert_instances ci
 						ON ci.repo_id = ca.repo_id AND ci.alert_number = ca.alert_number AND ci.ordinal = 1
 				WHERE ca.repo_id = r.repo_id
