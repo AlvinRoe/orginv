@@ -1151,7 +1151,7 @@ func upsertPackageVersionTx(tx *sql.Tx, packageID int64, version, purl, license,
 		INSERT INTO package_versions(
 			package_id, version, purl, license, supplier, license_declared, download_location, files_analyzed
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(package_id, version, purl) DO NOTHING
 	`, packageID, safeStr(version), safeStr(purl), license, supplier, licenseDeclared, downloadLocation, filesAnalyzed)
 	if err != nil {
