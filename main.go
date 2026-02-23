@@ -1046,17 +1046,13 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 		if err != nil {
 			return err
 		}
-		if packageVersionID != 0 {
-			packageVersionBySPDX[pkg.GetSPDXID()] = packageVersionID
-		}
-		if packageVersionID != 0 {
-			if _, err := tx.Exec(`
+		packageVersionBySPDX[pkg.GetSPDXID()] = packageVersionID
+		if _, err := tx.Exec(`
 				INSERT INTO repo_package_versions(repo_id, package_version_id, source)
 				VALUES (?, ?, 'sbom')
 				ON CONFLICT(repo_id, package_version_id, source) DO NOTHING
 			`, repoID, packageVersionID); err != nil {
-				return err
-			}
+			return err
 		}
 
 		if _, err := tx.Exec(`
@@ -1070,7 +1066,7 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 					license_declared = excluded.license_declared,
 					download_location = excluded.download_location,
 					files_analyzed = excluded.files_analyzed
-			`, sbomID, pkg.GetSPDXID(), nullableInt64Value(packageVersionID), pkg.GetLicenseConcluded(), pkg.GetLicenseDeclared(), pkg.GetDownloadLocation(), boolPtrToIntPtr(pkg.FilesAnalyzed)); err != nil {
+			`, sbomID, pkg.GetSPDXID(), packageVersionID, pkg.GetLicenseConcluded(), pkg.GetLicenseDeclared(), pkg.GetDownloadLocation(), boolPtrToIntPtr(pkg.FilesAnalyzed)); err != nil {
 			return err
 		}
 
