@@ -31,7 +31,7 @@ type dbWriteOp struct {
 	apply    func(context.Context) error
 }
 
-type runState struct {
+type State struct {
 	repoIDByName sqlite.RepoIndex
 	activeRepos  []*gogithub.Repository
 	writeOps     []dbWriteOp
@@ -46,33 +46,18 @@ func NewRunner(cfg config.Config, client *githubclient.Client, store *sqlite.Sto
 	return &Runner{cfg: cfg, client: client, store: store, exporter: exporter}
 }
 
-func (r *Runner) Run(ctx context.Context) error {
-	state := &runState{writeOps: make([]dbWriteOp, 0)}
-
-	if err := r.bootstrap(ctx); err != nil {
-		return err
-	}
-	if err := r.loadRepoBaseline(ctx, state); err != nil {
-		return err
-	}
-	r.fetchDatasets(ctx, state)
-	r.executeWrites(ctx, state)
-	if err := r.exportReport(ctx); err != nil {
-		return err
-	}
-	r.finalize(state)
-
-	return nil
+func NewState() *State {
+	return &State{writeOps: make([]dbWriteOp, 0)}
 }
 
-func (r *Runner) bootstrap(ctx context.Context) error {
+func (r *Runner) Bootstrap(ctx context.Context) error {
 	if err := r.store.InitSchema(ctx); err != nil {
 		return fmt.Errorf("failed to initialize sqlite schema: %w", err)
 	}
 	return nil
 }
 
-func (r *Runner) loadRepoBaseline(ctx context.Context, state *runState) error {
+func (r *Runner) LoadRepoBaseline(ctx context.Context, state *State) error {
 	repos, err := r.client.FetchAllRepos(ctx, r.cfg.Org, r.cfg.ResultsPerPage)
 	if err != nil {
 		return fmt.Errorf("failed to fetch repositories: %w", err)
@@ -91,7 +76,7 @@ func (r *Runner) loadRepoBaseline(ctx context.Context, state *runState) error {
 	return nil
 }
 
-func (r *Runner) fetchDatasets(ctx context.Context, state *runState) {
+func (r *Runner) FetchDatasets(ctx context.Context, state *State) {
 	log.Printf("stage ingestion: fetching org-level alert datasets")
 	r.fetchOrgAlertDatasets(ctx, state)
 
@@ -99,7 +84,7 @@ func (r *Runner) fetchDatasets(ctx context.Context, state *runState) {
 	r.fetchSBOMDatasets(ctx, state)
 }
 
-func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, state *runState) {
+func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, state *State) {
 	var orgWG sync.WaitGroup
 	orgFetch := []struct {
 		name string
@@ -180,7 +165,7 @@ func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, state *runState) {
 	orgWG.Wait()
 }
 
-func (r *Runner) fetchSBOMDatasets(ctx context.Context, state *runState) {
+func (r *Runner) fetchSBOMDatasets(ctx context.Context, state *State) {
 	repoChan := make(chan *gogithub.Repository, len(state.activeRepos))
 	var repoWG sync.WaitGroup
 
@@ -220,7 +205,7 @@ func (r *Runner) fetchSBOMDatasets(ctx context.Context, state *runState) {
 	repoWG.Wait()
 }
 
-func (r *Runner) executeWrites(ctx context.Context, state *runState) {
+func (r *Runner) ExecuteWrites(ctx context.Context, state *State) {
 	log.Printf("stage writes: queued db operations=%d", len(state.writeOps))
 	sort.SliceStable(state.writeOps, func(i, j int) bool {
 		if state.writeOps[i].priority == state.writeOps[j].priority {
@@ -240,14 +225,14 @@ func (r *Runner) executeWrites(ctx context.Context, state *runState) {
 	}
 }
 
-func (r *Runner) exportReport(ctx context.Context) error {
+func (r *Runner) ExportReport(ctx context.Context) error {
 	if err := r.exporter.ExportCSV(ctx, r.cfg.CSVOutputPath); err != nil {
 		return fmt.Errorf("failed to export csv report: %w", err)
 	}
 	return nil
 }
 
-func (r *Runner) finalize(state *runState) {
+func (r *Runner) Finalize(state *State) {
 	if len(state.errorsSeen) > 0 {
 		log.Printf("completed with %d ingestion errors (see logs)", len(state.errorsSeen))
 	}
@@ -256,14 +241,14 @@ func (r *Runner) finalize(state *runState) {
 	log.Printf("csv output: %s", r.cfg.CSVOutputPath)
 }
 
-func (s *runState) recordErr(msg string, err error) {
+func (s *State) recordErr(msg string, err error) {
 	s.errorsMu.Lock()
 	defer s.errorsMu.Unlock()
 	s.errorsSeen = append(s.errorsSeen, fmt.Sprintf("%s: %v", msg, err))
 	log.Printf("%s: %v", msg, err)
 }
 
-func (s *runState) enqueueWriteOp(op dbWriteOp) {
+func (s *State) enqueueWriteOp(op dbWriteOp) {
 	s.writeOpsMu.Lock()
 	s.writeOps = append(s.writeOps, op)
 	s.writeOpsMu.Unlock()
