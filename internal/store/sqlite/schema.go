@@ -1,0 +1,368 @@
+package sqlite
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+func initSQLite(db *sql.DB) error {
+	if err := applySchemaMigrations(db); err != nil {
+		return err
+	}
+
+	schema := []string{
+		`PRAGMA foreign_keys = ON;`,
+		`PRAGMA journal_mode = WAL;`,
+		`CREATE TABLE IF NOT EXISTS licenses (
+			license_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			license_key TEXT,
+			spdx_id TEXT,
+			name TEXT,
+			url TEXT,
+			UNIQUE (license_key, spdx_id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS repos (
+			repo_id INTEGER PRIMARY KEY,
+			org_login TEXT NOT NULL,
+			name TEXT NOT NULL,
+			full_name TEXT NOT NULL,
+			visibility TEXT,
+			private INTEGER NOT NULL,
+			archived INTEGER NOT NULL,
+			disabled INTEGER NOT NULL,
+			default_branch TEXT,
+			language TEXT,
+			open_issues_count INTEGER,
+			description TEXT,
+			topics TEXT,
+			size_kb INTEGER,
+			forks_count INTEGER,
+			stargazers_count INTEGER,
+			has_issues INTEGER,
+			has_projects INTEGER,
+			has_wiki INTEGER,
+			has_pages INTEGER,
+			has_discussions INTEGER,
+			is_fork INTEGER,
+			is_template INTEGER,
+			license_id INTEGER,
+			advanced_security_status TEXT,
+			secret_scanning_status TEXT,
+			secret_scanning_push_protection_status TEXT,
+			dependabot_security_updates_status TEXT,
+			node_id TEXT,
+			html_url TEXT,
+			clone_url TEXT,
+			git_url TEXT,
+			mirror_url TEXT,
+			ssh_url TEXT,
+			svn_url TEXT,
+			network_count INTEGER,
+			subscribers_count INTEGER,
+			watchers_count INTEGER,
+			watchers INTEGER,
+			auto_init INTEGER,
+			allow_rebase_merge INTEGER,
+			allow_update_branch INTEGER,
+			allow_squash_merge INTEGER,
+			allow_merge_commit INTEGER,
+			allow_auto_merge INTEGER,
+			allow_forking INTEGER,
+			web_commit_signoff_required INTEGER,
+			delete_branch_on_merge INTEGER,
+			use_squash_pr_title_as_default INTEGER,
+			has_downloads INTEGER,
+			secret_scanning_validity_checks_status TEXT,
+			team_id INTEGER,
+			immerse_ask_id TEXT,
+			immerse_jfrog_project_key TEXT,
+			immerse_sast_compliant INTEGER,
+			FOREIGN KEY(license_id) REFERENCES licenses(license_id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS repo_sast_scanners (
+			repo_id INTEGER NOT NULL,
+			scanner TEXT NOT NULL,
+			PRIMARY KEY (repo_id, scanner)
+		);`,
+		`CREATE TABLE IF NOT EXISTS packages (
+			package_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			ecosystem TEXT NOT NULL DEFAULT '',
+			name TEXT NOT NULL DEFAULT '',
+			version TEXT NOT NULL DEFAULT '',
+			purl TEXT NOT NULL DEFAULT '',
+			license TEXT,
+			supplier TEXT,
+			license_declared TEXT,
+			download_location TEXT,
+			files_analyzed INTEGER,
+			UNIQUE (ecosystem, name, version, purl)
+		);`,
+		`CREATE TABLE IF NOT EXISTS repo_packages (
+			repo_id INTEGER NOT NULL,
+			package_id INTEGER NOT NULL,
+			source TEXT NOT NULL,
+			PRIMARY KEY (repo_id, package_id, source),
+			FOREIGN KEY(package_id) REFERENCES packages(package_id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS sbom_documents (
+			sbom_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			repo_id INTEGER NOT NULL UNIQUE,
+			spdx_id TEXT,
+			spdx_version TEXT,
+			document_name TEXT,
+			data_license TEXT,
+			document_namespace TEXT,
+			generated_at TEXT,
+			creation_creators TEXT,
+			document_describes_count INTEGER,
+			package_count INTEGER,
+			relationship_count INTEGER
+		);`,
+		`CREATE TABLE IF NOT EXISTS sbom_document_packages (
+			sbom_id INTEGER NOT NULL,
+			spdx_package_id TEXT NOT NULL,
+			package_id INTEGER,
+			license_concluded TEXT,
+			license_declared TEXT,
+			download_location TEXT,
+			files_analyzed INTEGER,
+			PRIMARY KEY (sbom_id, spdx_package_id),
+			FOREIGN KEY(sbom_id) REFERENCES sbom_documents(sbom_id),
+			FOREIGN KEY(package_id) REFERENCES packages(package_id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS sbom_package_external_refs (
+			sbom_id INTEGER NOT NULL,
+			spdx_package_id TEXT,
+			reference_category TEXT,
+			reference_type TEXT,
+			reference_locator TEXT,
+			PRIMARY KEY (sbom_id, spdx_package_id, reference_category, reference_type, reference_locator)
+		);`,
+		`CREATE TABLE IF NOT EXISTS sbom_relationships (
+			sbom_id INTEGER NOT NULL,
+			from_package_id INTEGER,
+			to_package_id INTEGER,
+			relationship_type TEXT NOT NULL,
+			from_spdx_id TEXT,
+			to_spdx_id TEXT,
+			PRIMARY KEY (sbom_id, from_spdx_id, to_spdx_id, relationship_type),
+			FOREIGN KEY(sbom_id) REFERENCES sbom_documents(sbom_id),
+			FOREIGN KEY(from_package_id) REFERENCES packages(package_id),
+			FOREIGN KEY(to_package_id) REFERENCES packages(package_id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS dependabot_alerts (
+			repo_id INTEGER NOT NULL,
+			alert_number INTEGER NOT NULL,
+			state TEXT,
+			severity TEXT,
+			package_id INTEGER,
+			manifest_path TEXT,
+			created_at TEXT,
+			updated_at TEXT,
+			fixed_at TEXT,
+			dismissed_reason TEXT,
+			dependency_id INTEGER,
+			url TEXT,
+			html_url TEXT,
+			dismissed_at TEXT,
+			dismissed_comment TEXT,
+			auto_dismissed_at TEXT,
+			dependency_scope TEXT,
+			PRIMARY KEY (repo_id, alert_number)
+		);`,
+		`CREATE TABLE IF NOT EXISTS security_advisories (
+			advisory_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			ghsa_id TEXT,
+			cve_id TEXT,
+			summary TEXT,
+			description TEXT,
+			severity TEXT,
+			cvss_score REAL,
+			cvss_vector_string TEXT,
+			epss_percentage REAL,
+			epss_percentile REAL,
+			published_at TEXT,
+			updated_at TEXT,
+			withdrawn_at TEXT,
+			UNIQUE (ghsa_id, cve_id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS dependabot_alert_advisories (
+			repo_id INTEGER NOT NULL,
+			alert_number INTEGER NOT NULL,
+			advisory_id INTEGER NOT NULL,
+			PRIMARY KEY (repo_id, alert_number)
+		);`,
+		`CREATE TABLE IF NOT EXISTS security_advisory_vulnerabilities (
+			advisory_id INTEGER NOT NULL,
+			package_key_id INTEGER NOT NULL,
+			package_ordinal INTEGER NOT NULL,
+			severity TEXT,
+			vulnerable_version_range TEXT,
+			first_patched_version TEXT,
+			PRIMARY KEY (advisory_id, package_key_id, package_ordinal)
+		);`,
+		`CREATE TABLE IF NOT EXISTS advisory_references (
+			reference_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			url TEXT NOT NULL UNIQUE
+		);`,
+		`CREATE TABLE IF NOT EXISTS security_advisory_references (
+			advisory_id INTEGER NOT NULL,
+			reference_id INTEGER NOT NULL,
+			ref_num INTEGER NOT NULL,
+			PRIMARY KEY (advisory_id, reference_id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS cwes (
+			cwe_id TEXT PRIMARY KEY,
+			name TEXT
+		);`,
+		`CREATE TABLE IF NOT EXISTS security_advisory_cwes (
+			advisory_id INTEGER NOT NULL,
+			cwe_id TEXT NOT NULL,
+			PRIMARY KEY (advisory_id, cwe_id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS code_scanning_alerts (
+			repo_id INTEGER NOT NULL,
+			alert_number INTEGER NOT NULL,
+			state TEXT,
+			severity TEXT,
+			created_at TEXT,
+			fixed_at TEXT,
+			updated_at TEXT,
+			closed_at TEXT,
+			url TEXT,
+			html_url TEXT,
+			instances_url TEXT,
+			dismissed_at TEXT,
+			dismissed_reason TEXT,
+			dismissed_comment TEXT,
+			PRIMARY KEY (repo_id, alert_number)
+		);`,
+		`CREATE TABLE IF NOT EXISTS code_scanning_alert_instances (
+			repo_id INTEGER NOT NULL,
+			alert_number INTEGER NOT NULL,
+			ordinal INTEGER NOT NULL,
+			ref TEXT,
+			commit_sha TEXT,
+			path TEXT,
+			start_line INTEGER,
+			end_line INTEGER,
+			start_column INTEGER,
+			end_column INTEGER,
+			state TEXT,
+			category TEXT,
+			classifications TEXT,
+			analysis_key TEXT,
+			environment TEXT,
+			PRIMARY KEY (repo_id, alert_number, ordinal)
+		);`,
+		`CREATE TABLE IF NOT EXISTS secret_scanning_alerts (
+			repo_id INTEGER NOT NULL,
+			alert_number INTEGER NOT NULL,
+			state TEXT,
+			secret_type TEXT,
+			resolution TEXT,
+			created_at TEXT,
+			updated_at TEXT,
+			resolved_at TEXT,
+			url TEXT,
+			html_url TEXT,
+			locations_url TEXT,
+			secret_type_display_name TEXT,
+			secret TEXT,
+			is_base64_encoded INTEGER,
+			multi_repo INTEGER,
+			publicly_leaked INTEGER,
+			push_protection_bypassed INTEGER,
+			push_protection_bypassed_at TEXT,
+			resolution_comment TEXT,
+			push_protection_bypass_request_comment TEXT,
+			push_protection_bypass_request_html_url TEXT,
+			validity TEXT,
+			has_more_locations INTEGER,
+			PRIMARY KEY (repo_id, alert_number)
+		);`,
+		`CREATE TABLE IF NOT EXISTS secret_scanning_alert_locations (
+			repo_id INTEGER NOT NULL,
+			alert_number INTEGER NOT NULL,
+			ordinal INTEGER NOT NULL,
+			path TEXT,
+			start_line INTEGER,
+			end_line INTEGER,
+			start_column INTEGER,
+			end_column INTEGER,
+			blob_sha TEXT,
+			blob_url TEXT,
+			commit_sha TEXT,
+			commit_url TEXT,
+			pull_request_comment_url TEXT,
+			PRIMARY KEY (repo_id, alert_number, ordinal)
+		);`,
+	}
+
+	for _, stmt := range schema {
+		if _, err := db.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func applySchemaMigrations(db *sql.DB) error {
+	drops := []string{
+		"secret_scanning_alert_locations",
+		"secret_scanning_alerts",
+		"code_scanning_rule_tags",
+		"code_scanning_tags",
+		"code_scanning_alert_instances",
+		"code_scanning_rules",
+		"code_scanning_tools",
+		"code_scanning_alerts",
+		"security_advisory_cwes",
+		"cwes",
+		"security_advisory_references",
+		"advisory_references",
+		"security_advisory_identifiers",
+		"advisory_identifiers",
+		"security_advisory_vulnerabilities",
+		"dependabot_alert_advisories",
+		"security_advisories",
+		"dependabot_security_advisories",
+		"dependabot_alerts",
+		"sbom_relationships",
+		"sbom_package_external_refs",
+		"sbom_document_packages",
+		"sbom_document_describes",
+		"sbom_documents",
+		"repo_packages",
+		"repo_package_versions",
+		"package_versions",
+		"packages",
+		"repo_sast_scanners",
+		"licenses",
+		"repo_merge_policies",
+		"repo_owners",
+		"repos",
+		"secret_scanning_first_locations",
+		"dependabot_advisory_cwes",
+		"dependabot_advisory_references",
+		"dependabot_references",
+		"dependabot_advisory_identifiers",
+		"dependabot_identifiers",
+		"dependabot_advisory_vulnerabilities",
+		"repo_dependencies",
+		"dependencies",
+	}
+	if _, err := db.Exec(`PRAGMA foreign_keys = OFF;`); err != nil {
+		return err
+	}
+	for _, table := range drops {
+		if _, err := db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", table)); err != nil {
+			return err
+		}
+	}
+	_, err := db.Exec(`PRAGMA foreign_keys = ON;`)
+	if err != nil {
+		return err
+	}
+	return nil
+}
