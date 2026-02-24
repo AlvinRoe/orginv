@@ -110,8 +110,9 @@ func ingestCodeScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts 
 	stmt, err := tx.Prepare(`
 		INSERT INTO code_scanning_alerts(
 			repo_id, alert_number, state, severity,
-			created_at, fixed_at, updated_at, closed_at, url, html_url, instances_url, dismissed_at, dismissed_reason, dismissed_comment
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			created_at, fixed_at, updated_at, closed_at, url, html_url, instances_url, dismissed_at, dismissed_reason, dismissed_comment,
+			ref, commit_sha, path, start_line, end_line, start_column, end_column, most_recent_state, category, classifications, analysis_key
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(repo_id, alert_number) DO UPDATE SET
 			state = excluded.state,
 			severity = excluded.severity,
@@ -124,7 +125,18 @@ func ingestCodeScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts 
 			instances_url = excluded.instances_url,
 			dismissed_at = excluded.dismissed_at,
 			dismissed_reason = excluded.dismissed_reason,
-			dismissed_comment = excluded.dismissed_comment
+			dismissed_comment = excluded.dismissed_comment,
+			ref = excluded.ref,
+			commit_sha = excluded.commit_sha,
+			path = excluded.path,
+			start_line = excluded.start_line,
+			end_line = excluded.end_line,
+			start_column = excluded.start_column,
+			end_column = excluded.end_column,
+			most_recent_state = excluded.most_recent_state,
+			category = excluded.category,
+			classifications = excluded.classifications,
+			analysis_key = excluded.analysis_key
 	`)
 	if err != nil {
 		return err
@@ -142,6 +154,7 @@ func ingestCodeScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts 
 			skippedRepo++
 			continue
 		}
+		snapshot := snapshotCodeScanningInstance(a.GetMostRecentInstance())
 		_, err = stmt.Exec(
 			repoID,
 			a.GetNumber(),
@@ -157,11 +170,19 @@ func ingestCodeScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts 
 			formatGitHubTimePtr(a.DismissedAt),
 			a.GetDismissedReason(),
 			a.GetDismissedComment(),
+			snapshot.ref,
+			snapshot.commitSHA,
+			snapshot.path,
+			snapshot.startLine,
+			snapshot.endLine,
+			snapshot.startColumn,
+			snapshot.endColumn,
+			snapshot.state,
+			snapshot.category,
+			snapshot.classifications,
+			mostRecentAnalysisKey(a.GetMostRecentInstance()),
 		)
 		if err != nil {
-			return err
-		}
-		if err := upsertCodeScanningAlertInstanceTx(tx, repoID, a.GetNumber(), a.GetMostRecentInstance()); err != nil {
 			return err
 		}
 		inserted++
@@ -169,23 +190,6 @@ func ingestCodeScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts 
 	log.Printf("code scanning ingest summary: total=%d inserted=%d skipped_repo=%d", len(alerts), inserted, skippedRepo)
 
 	return tx.Commit()
-}
-
-func upsertCodeScanningAlertInstanceTx(tx *sql.Tx, repoID int64, alertNumber int, inst *github.MostRecentInstance) error {
-	if _, err := tx.Exec(`DELETE FROM code_scanning_alert_instances WHERE repo_id = ? AND alert_number = ?`, repoID, alertNumber); err != nil {
-		return err
-	}
-	snapshot := snapshotCodeScanningInstance(inst)
-	_, err := tx.Exec(`
-		INSERT INTO code_scanning_alert_instances(
-			repo_id, alert_number, ordinal, ref, commit_sha, path, start_line, end_line, start_column, end_column,
-			state, category, classifications, analysis_key, environment
-		)
-		VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, repoID, alertNumber, snapshot.ref, snapshot.commitSHA, snapshot.path, snapshot.startLine, snapshot.endLine,
-		snapshot.startColumn, snapshot.endColumn, snapshot.state, snapshot.category, snapshot.classifications,
-		mostRecentAnalysisKey(inst), mostRecentEnvironment(inst))
-	return err
 }
 
 func ingestSecretScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts []*github.SecretScanningAlert) error {
@@ -196,13 +200,14 @@ func ingestSecretScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alert
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO secret_scanning_alerts(
+		INSERT INTO secret_alerts(
 			repo_id, alert_number, state, secret_type, resolution, created_at, updated_at, resolved_at,
 			url, html_url, locations_url, secret_type_display_name, secret, is_base64_encoded, multi_repo, publicly_leaked,
 			push_protection_bypassed,
 			push_protection_bypassed_at, resolution_comment, push_protection_bypass_request_comment,
-			push_protection_bypass_request_html_url, validity, has_more_locations
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			push_protection_bypass_request_html_url, validity, has_more_locations,
+			path, start_line, end_line, start_column, end_column, blob_sha, blob_url, commit_sha, commit_url, pull_request_comment_url
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(repo_id, alert_number) DO UPDATE SET
 			state = excluded.state,
 			secret_type = excluded.secret_type,
@@ -224,7 +229,17 @@ func ingestSecretScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alert
 			push_protection_bypass_request_comment = excluded.push_protection_bypass_request_comment,
 			push_protection_bypass_request_html_url = excluded.push_protection_bypass_request_html_url,
 			validity = excluded.validity,
-			has_more_locations = excluded.has_more_locations
+			has_more_locations = excluded.has_more_locations,
+			path = excluded.path,
+			start_line = excluded.start_line,
+			end_line = excluded.end_line,
+			start_column = excluded.start_column,
+			end_column = excluded.end_column,
+			blob_sha = excluded.blob_sha,
+			blob_url = excluded.blob_url,
+			commit_sha = excluded.commit_sha,
+			commit_url = excluded.commit_url,
+			pull_request_comment_url = excluded.pull_request_comment_url
 	`)
 	if err != nil {
 		return err
@@ -241,6 +256,31 @@ func ingestSecretScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alert
 		if !ok {
 			skippedRepo++
 			continue
+		}
+		loc := a.GetFirstLocationDetected()
+		var (
+			path                  string
+			startLine             interface{}
+			endLine               interface{}
+			startColumn           interface{}
+			endColumn             interface{}
+			blobSHA               string
+			blobURL               string
+			commitSHA             string
+			commitURL             string
+			pullRequestCommentURL string
+		)
+		if loc != nil {
+			path = loc.GetPath()
+			startLine = nullableIntPtr(loc.Startline)
+			endLine = nullableIntPtr(loc.EndLine)
+			startColumn = nullableIntPtr(loc.StartColumn)
+			endColumn = nullableIntPtr(loc.EndColumn)
+			blobSHA = loc.GetBlobSHA()
+			blobURL = loc.GetBlobURL()
+			commitSHA = loc.GetCommitSHA()
+			commitURL = loc.GetCommitURL()
+			pullRequestCommentURL = loc.GetPullRequestCommentURL()
 		}
 		_, err := stmt.Exec(
 			repoID,
@@ -266,11 +306,18 @@ func ingestSecretScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alert
 			a.GetPushProtectionBypassRequestHTMLURL(),
 			a.GetValidity(),
 			boolPtrToIntPtr(a.HasMoreLocations),
+			path,
+			startLine,
+			endLine,
+			startColumn,
+			endColumn,
+			blobSHA,
+			blobURL,
+			commitSHA,
+			commitURL,
+			pullRequestCommentURL,
 		)
 		if err != nil {
-			return err
-		}
-		if err := upsertSecretScanningFirstLocationTx(tx, repoID, a.GetNumber(), a.GetFirstLocationDetected()); err != nil {
 			return err
 		}
 		inserted++
@@ -278,24 +325,6 @@ func ingestSecretScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alert
 	log.Printf("secret scanning ingest summary: total=%d inserted=%d skipped_repo=%d", len(alerts), inserted, skippedRepo)
 
 	return tx.Commit()
-}
-
-func upsertSecretScanningFirstLocationTx(tx *sql.Tx, repoID int64, alertNumber int, loc *github.SecretScanningAlertLocationDetails) error {
-	if _, err := tx.Exec(`DELETE FROM secret_scanning_alert_locations WHERE repo_id = ? AND alert_number = ?`, repoID, alertNumber); err != nil {
-		return err
-	}
-	if loc == nil {
-		return nil
-	}
-	_, err := tx.Exec(`
-		INSERT INTO secret_scanning_alert_locations(
-			repo_id, alert_number, ordinal, path, start_line, end_line, start_column, end_column,
-			blob_sha, blob_url, commit_sha, commit_url, pull_request_comment_url
-		)
-		VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, repoID, alertNumber, loc.GetPath(), nullableIntPtr(loc.Startline), nullableIntPtr(loc.EndLine), nullableIntPtr(loc.StartColumn),
-		nullableIntPtr(loc.EndColumn), loc.GetBlobSHA(), loc.GetBlobURL(), loc.GetCommitSHA(), loc.GetCommitURL(), loc.GetPullRequestCommentURL())
-	return err
 }
 
 func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAlert) error {
@@ -322,15 +351,15 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAl
 	}
 
 	if _, err := tx.Exec(`
-		DELETE FROM security_advisory_vulnerabilities WHERE advisory_id = ?;
-		DELETE FROM security_advisory_references WHERE advisory_id = ?;
-		DELETE FROM security_advisory_cwes WHERE advisory_id = ?;
+		DELETE FROM advisory_vulnerabilities WHERE advisory_id = ?;
+		DELETE FROM advisory_reference_links WHERE advisory_id = ?;
+		DELETE FROM advisory_cwes WHERE advisory_id = ?;
 	`, advisoryID, advisoryID, advisoryID); err != nil {
 		return err
 	}
 
 	vulnStmt, err := tx.Prepare(`
-		INSERT INTO security_advisory_vulnerabilities(
+		INSERT INTO advisory_vulnerabilities(
 			advisory_id, package_key_id, package_ordinal, severity, vulnerable_version_range,
 			first_patched_version
 		) VALUES (?, ?, ?, ?, ?, ?)
@@ -341,7 +370,7 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAl
 	defer vulnStmt.Close()
 
 	advRefStmt, err := tx.Prepare(`
-		INSERT INTO security_advisory_references(advisory_id, reference_id, ref_num)
+		INSERT INTO advisory_reference_links(advisory_id, reference_id, ref_num)
 		VALUES (?, ?, ?)
 		ON CONFLICT(advisory_id, reference_id) DO NOTHING
 	`)
@@ -351,7 +380,7 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAl
 	defer advRefStmt.Close()
 
 	advCWEStmt, err := tx.Prepare(`
-		INSERT INTO security_advisory_cwes(advisory_id, cwe_id)
+		INSERT INTO advisory_cwes(advisory_id, cwe_id)
 		VALUES (?, ?)
 		ON CONFLICT(advisory_id, cwe_id) DO NOTHING
 	`)
@@ -431,7 +460,7 @@ func upsertSecurityAdvisoryTx(tx *sql.Tx, adv *github.DependabotSecurityAdvisory
 	var existingID int64
 	err := tx.QueryRow(`
 		SELECT advisory_id
-		FROM security_advisories
+		FROM advisories
 		WHERE ghsa_id = ? AND cve_id = ?
 		LIMIT 1
 	`, ghsaID, cveID).Scan(&existingID)
@@ -466,7 +495,7 @@ func upsertSecurityAdvisoryTx(tx *sql.Tx, adv *github.DependabotSecurityAdvisory
 
 	if existingID != 0 {
 		_, err = tx.Exec(`
-			UPDATE security_advisories
+			UPDATE advisories
 			SET
 				summary = ?,
 				description = ?,
@@ -484,7 +513,7 @@ func upsertSecurityAdvisoryTx(tx *sql.Tx, adv *github.DependabotSecurityAdvisory
 	}
 
 	res, err := tx.Exec(`
-		INSERT INTO security_advisories(
+		INSERT INTO advisories(
 			ghsa_id, cve_id, summary, description, severity, cvss_score,
 			cvss_vector_string, epss_percentage, epss_percentile, published_at, updated_at, withdrawn_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)

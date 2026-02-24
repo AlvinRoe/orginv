@@ -8,6 +8,14 @@ import (
 	"github.com/google/go-github/v82/github"
 )
 
+func normalizeSBOMDownloadLocation(v string) string {
+	v = strings.TrimSpace(v)
+	if strings.EqualFold(v, "NOASSERTION") {
+		return ""
+	}
+	return v
+}
+
 func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 	if sbom == nil || sbom.SBOM == nil {
 		return nil
@@ -21,7 +29,7 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 	defer tx.Rollback()
 
 	_, err = tx.Exec(`
-		INSERT INTO sbom_documents(
+		INSERT INTO sbom(
 			repo_id, spdx_id, spdx_version, document_name, data_license,
 			document_namespace, generated_at, creation_creators, document_describes_count, package_count, relationship_count
 		)
@@ -55,12 +63,12 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 	}
 
 	var sbomID int64
-	if err := tx.QueryRow(`SELECT sbom_id FROM sbom_documents WHERE repo_id = ?`, repoID).Scan(&sbomID); err != nil {
+	if err := tx.QueryRow(`SELECT sbom_id FROM sbom WHERE repo_id = ?`, repoID).Scan(&sbomID); err != nil {
 		return err
 	}
 
 	if _, err := tx.Exec(`
-		DELETE FROM sbom_document_packages WHERE sbom_id = ?;
+		DELETE FROM sbom_packages WHERE sbom_id = ?;
 		DELETE FROM sbom_package_external_refs WHERE sbom_id = ?;
 		DELETE FROM sbom_relationships WHERE sbom_id = ?;
 	`, sbomID, sbomID, sbomID); err != nil {
@@ -78,16 +86,14 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 	defer repoPackageStmt.Close()
 
 	sbomDocPackageStmt, err := tx.Prepare(`
-		INSERT INTO sbom_document_packages(
-			sbom_id, spdx_package_id, package_id, license_concluded, license_declared, download_location, files_analyzed
+		INSERT INTO sbom_packages(
+			sbom_id, spdx_package_id, package_id, license_concluded, download_location
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(sbom_id, spdx_package_id) DO UPDATE SET
 			package_id = excluded.package_id,
 			license_concluded = excluded.license_concluded,
-			license_declared = excluded.license_declared,
-			download_location = excluded.download_location,
-			files_analyzed = excluded.files_analyzed
+			download_location = excluded.download_location
 	`)
 	if err != nil {
 		return err
@@ -96,7 +102,7 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 
 	externalRefStmt, err := tx.Prepare(`
 		INSERT INTO sbom_package_external_refs(
-			sbom_id, spdx_package_id, reference_category, reference_type, reference_locator
+			sbom_id, package_id, reference_category, reference_type, reference_locator
 		) VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT DO NOTHING
 	`)
@@ -107,9 +113,9 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 
 	relationshipStmt, err := tx.Prepare(`
 		INSERT INTO sbom_relationships(
-			sbom_id, from_package_id, to_package_id, relationship_type, from_spdx_id, to_spdx_id
+			sbom_id, from_package_id, to_package_id, relationship_type
 		)
-		VALUES (?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?)
 		ON CONFLICT DO NOTHING
 	`)
 	if err != nil {
@@ -137,10 +143,10 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 			packageName,
 			pkg.GetVersionInfo(),
 			purl,
-			"",
+			firstNonEmpty(pkg.GetLicenseConcluded(), pkg.GetLicenseDeclared()),
 			"",
 			pkg.GetLicenseDeclared(),
-			pkg.GetDownloadLocation(),
+			normalizeSBOMDownloadLocation(pkg.GetDownloadLocation()),
 			boolPtrToIntPtr(pkg.FilesAnalyzed),
 		)
 		if err != nil {
@@ -161,9 +167,7 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 			pkg.GetSPDXID(),
 			packageID,
 			pkg.GetLicenseConcluded(),
-			pkg.GetLicenseDeclared(),
-			pkg.GetDownloadLocation(),
-			boolPtrToIntPtr(pkg.FilesAnalyzed),
+			normalizeSBOMDownloadLocation(pkg.GetDownloadLocation()),
 		); err != nil {
 			return fmt.Errorf("sbom document package insert failed (repo_id=%d sbom_id=%d spdx=%q package_id=%d): %w", repoID, sbomID, pkg.GetSPDXID(), packageID, err)
 		}
@@ -172,9 +176,9 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 			if ref == nil {
 				continue
 			}
-			_, err := externalRefStmt.Exec(sbomID, pkg.GetSPDXID(), ref.ReferenceCategory, ref.ReferenceType, ref.ReferenceLocator)
+			_, err := externalRefStmt.Exec(sbomID, packageID, ref.ReferenceCategory, ref.ReferenceType, ref.ReferenceLocator)
 			if err != nil {
-				return fmt.Errorf("sbom external ref insert failed (repo_id=%d sbom_id=%d spdx=%q ref_type=%q locator=%q): %w", repoID, sbomID, pkg.GetSPDXID(), ref.ReferenceType, ref.ReferenceLocator, err)
+				return fmt.Errorf("sbom external ref insert failed (repo_id=%d sbom_id=%d package_id=%d ref_type=%q locator=%q): %w", repoID, sbomID, packageID, ref.ReferenceType, ref.ReferenceLocator, err)
 			}
 		}
 	}
@@ -193,8 +197,6 @@ func ingestSBOM(db *sql.DB, repoID int64, sbom *github.SBOM) error {
 			nullableInt64(okFrom, fromID),
 			nullableInt64(okTo, toID),
 			rel.RelationshipType,
-			rel.SPDXElementID,
-			rel.RelatedSPDXElement,
 		)
 		if err != nil {
 			return fmt.Errorf("sbom relationship insert failed (repo_id=%d sbom_id=%d from_spdx=%q to_spdx=%q from_package_id=%v to_package_id=%v): %w", repoID, sbomID, rel.SPDXElementID, rel.RelatedSPDXElement, nullableInt64(okFrom, fromID), nullableInt64(okTo, toID), err)

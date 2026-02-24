@@ -9,7 +9,6 @@ import (
 
 func upsertRepo(db *sql.DB, org string, repo *github.Repository) error {
 	topics := strings.Join(repo.Topics, ",")
-	licenseID, err := upsertLicenseDB(db, repo.License)
 	advancedSecurityStatus := ""
 	secretScanningStatus := ""
 	secretScanningPushProtectionStatus := ""
@@ -32,20 +31,16 @@ func upsertRepo(db *sql.DB, org string, repo *github.Repository) error {
 			secretScanningValidityChecksStatus = repo.SecurityAndAnalysis.SecretScanningValidityChecks.GetStatus()
 		}
 	}
-	if err != nil {
-		return err
-	}
 
-	_, err = db.Exec(`
+	_, err := db.Exec(`
 		INSERT INTO repos(
-			repo_id, org_login, name, full_name, visibility, private, archived, disabled,
+			repo_id, name, full_name, visibility, private, archived, disabled,
 			default_branch, language, open_issues_count, description, topics,
-			size_kb, forks_count, stargazers_count, has_issues, has_projects, has_wiki, has_pages,
-			has_discussions, is_fork, is_template, license_id, advanced_security_status,
+			size_kb, forks_count, stargazers_count, has_issues, has_projects, has_wiki, has_pages, has_discussions,
+			is_fork, is_template, advanced_security_status,
 			secret_scanning_status, secret_scanning_push_protection_status, dependabot_security_updates_status
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(repo_id) DO UPDATE SET
-			org_login = excluded.org_login,
 			name = excluded.name,
 			full_name = excluded.full_name,
 			visibility = excluded.visibility,
@@ -67,14 +62,12 @@ func upsertRepo(db *sql.DB, org string, repo *github.Repository) error {
 			has_discussions = excluded.has_discussions,
 			is_fork = excluded.is_fork,
 			is_template = excluded.is_template,
-			license_id = excluded.license_id,
 			advanced_security_status = excluded.advanced_security_status,
 			secret_scanning_status = excluded.secret_scanning_status,
 			secret_scanning_push_protection_status = excluded.secret_scanning_push_protection_status,
 			dependabot_security_updates_status = excluded.dependabot_security_updates_status
 	`,
 		repo.GetID(),
-		org,
 		repo.GetName(),
 		repo.GetFullName(),
 		repo.GetVisibility(),
@@ -96,7 +89,6 @@ func upsertRepo(db *sql.DB, org string, repo *github.Repository) error {
 		boolToInt(repo.GetHasDiscussions()),
 		boolToInt(repo.GetFork()),
 		boolToInt(repo.GetIsTemplate()),
-		licenseID,
 		advancedSecurityStatus,
 		secretScanningStatus,
 		secretScanningPushProtectionStatus,
@@ -133,37 +125,5 @@ func upsertRepo(db *sql.DB, org string, repo *github.Repository) error {
 		return err
 	}
 
-	return upsertRepoSASTScanners(db, repo.GetID(), immerseSASTScanners)
-}
-
-func upsertLicenseDB(db *sql.DB, license *github.License) (interface{}, error) {
-	if license == nil {
-		return nil, nil
-	}
-	key := strings.TrimSpace(license.GetKey())
-	spdx := strings.TrimSpace(license.GetSPDXID())
-	name := strings.TrimSpace(license.GetName())
-	url := strings.TrimSpace(license.GetURL())
-	if key == "" && spdx == "" && name == "" && url == "" {
-		return nil, nil
-	}
-	_, err := db.Exec(`
-		INSERT INTO licenses(license_key, spdx_id, name, url)
-		VALUES (?, ?, ?, ?)
-		ON CONFLICT(license_key, spdx_id) DO UPDATE SET
-			name = COALESCE(NULLIF(excluded.name, ''), licenses.name),
-			url = COALESCE(NULLIF(excluded.url, ''), licenses.url)
-	`, key, spdx, name, url)
-	if err != nil {
-		return nil, err
-	}
-	var licenseID int64
-	if err := db.QueryRow(`
-		SELECT license_id FROM licenses
-		WHERE license_key = ? AND spdx_id = ?
-		LIMIT 1
-	`, key, spdx).Scan(&licenseID); err != nil {
-		return nil, err
-	}
-	return licenseID, nil
+	return upsertRepoScanners(db, repo.GetID(), immerseSASTScanners)
 }

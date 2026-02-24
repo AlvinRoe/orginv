@@ -13,17 +13,8 @@ func initSQLite(db *sql.DB) error {
 	schema := []string{
 		`PRAGMA foreign_keys = ON;`,
 		`PRAGMA journal_mode = WAL;`,
-		`CREATE TABLE IF NOT EXISTS licenses (
-			license_id INTEGER PRIMARY KEY AUTOINCREMENT,
-			license_key TEXT,
-			spdx_id TEXT,
-			name TEXT,
-			url TEXT,
-			UNIQUE (license_key, spdx_id)
-		);`,
 		`CREATE TABLE IF NOT EXISTS repos (
 			repo_id INTEGER PRIMARY KEY,
-			org_login TEXT NOT NULL,
 			name TEXT NOT NULL,
 			full_name TEXT NOT NULL,
 			visibility TEXT,
@@ -45,7 +36,6 @@ func initSQLite(db *sql.DB) error {
 			has_discussions INTEGER,
 			is_fork INTEGER,
 			is_template INTEGER,
-			license_id INTEGER,
 			advanced_security_status TEXT,
 			secret_scanning_status TEXT,
 			secret_scanning_push_protection_status TEXT,
@@ -76,13 +66,18 @@ func initSQLite(db *sql.DB) error {
 			team_id INTEGER,
 			immerse_ask_id TEXT,
 			immerse_jfrog_project_key TEXT,
-			immerse_sast_compliant INTEGER,
-			FOREIGN KEY(license_id) REFERENCES licenses(license_id)
+			immerse_sast_compliant INTEGER
 		);`,
-		`CREATE TABLE IF NOT EXISTS repo_sast_scanners (
+		`CREATE TABLE IF NOT EXISTS scanners (
+			scanner_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			scanner TEXT NOT NULL UNIQUE
+		);`,
+		`CREATE TABLE IF NOT EXISTS repo_scanners (
 			repo_id INTEGER NOT NULL,
-			scanner TEXT NOT NULL,
-			PRIMARY KEY (repo_id, scanner)
+			scanner_id INTEGER NOT NULL,
+			PRIMARY KEY (repo_id, scanner_id),
+			FOREIGN KEY(repo_id) REFERENCES repos(repo_id),
+			FOREIGN KEY(scanner_id) REFERENCES scanners(scanner_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS packages (
 			package_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,7 +99,7 @@ func initSQLite(db *sql.DB) error {
 			PRIMARY KEY (repo_id, package_id, source),
 			FOREIGN KEY(package_id) REFERENCES packages(package_id)
 		);`,
-		`CREATE TABLE IF NOT EXISTS sbom_documents (
+		`CREATE TABLE IF NOT EXISTS sbom (
 			sbom_id INTEGER PRIMARY KEY AUTOINCREMENT,
 			repo_id INTEGER NOT NULL UNIQUE,
 			spdx_id TEXT,
@@ -118,35 +113,33 @@ func initSQLite(db *sql.DB) error {
 			package_count INTEGER,
 			relationship_count INTEGER
 		);`,
-		`CREATE TABLE IF NOT EXISTS sbom_document_packages (
+		`CREATE TABLE IF NOT EXISTS sbom_packages (
 			sbom_id INTEGER NOT NULL,
 			spdx_package_id TEXT NOT NULL,
 			package_id INTEGER,
 			license_concluded TEXT,
-			license_declared TEXT,
 			download_location TEXT,
-			files_analyzed INTEGER,
 			PRIMARY KEY (sbom_id, spdx_package_id),
-			FOREIGN KEY(sbom_id) REFERENCES sbom_documents(sbom_id),
+			FOREIGN KEY(sbom_id) REFERENCES sbom(sbom_id),
 			FOREIGN KEY(package_id) REFERENCES packages(package_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS sbom_package_external_refs (
 			sbom_id INTEGER NOT NULL,
-			spdx_package_id TEXT,
+			package_id INTEGER NOT NULL,
 			reference_category TEXT,
 			reference_type TEXT,
 			reference_locator TEXT,
-			PRIMARY KEY (sbom_id, spdx_package_id, reference_category, reference_type, reference_locator)
+			PRIMARY KEY (sbom_id, package_id, reference_category, reference_type, reference_locator),
+			FOREIGN KEY(sbom_id) REFERENCES sbom(sbom_id),
+			FOREIGN KEY(package_id) REFERENCES packages(package_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS sbom_relationships (
 			sbom_id INTEGER NOT NULL,
 			from_package_id INTEGER,
 			to_package_id INTEGER,
 			relationship_type TEXT NOT NULL,
-			from_spdx_id TEXT,
-			to_spdx_id TEXT,
-			PRIMARY KEY (sbom_id, from_spdx_id, to_spdx_id, relationship_type),
-			FOREIGN KEY(sbom_id) REFERENCES sbom_documents(sbom_id),
+			PRIMARY KEY (sbom_id, from_package_id, to_package_id, relationship_type),
+			FOREIGN KEY(sbom_id) REFERENCES sbom(sbom_id),
 			FOREIGN KEY(from_package_id) REFERENCES packages(package_id),
 			FOREIGN KEY(to_package_id) REFERENCES packages(package_id)
 		);`,
@@ -161,7 +154,6 @@ func initSQLite(db *sql.DB) error {
 			updated_at TEXT,
 			fixed_at TEXT,
 			dismissed_reason TEXT,
-			dependency_id INTEGER,
 			url TEXT,
 			html_url TEXT,
 			dismissed_at TEXT,
@@ -170,7 +162,7 @@ func initSQLite(db *sql.DB) error {
 			dependency_scope TEXT,
 			PRIMARY KEY (repo_id, alert_number)
 		);`,
-		`CREATE TABLE IF NOT EXISTS security_advisories (
+		`CREATE TABLE IF NOT EXISTS advisories (
 			advisory_id INTEGER PRIMARY KEY AUTOINCREMENT,
 			ghsa_id TEXT,
 			cve_id TEXT,
@@ -192,7 +184,7 @@ func initSQLite(db *sql.DB) error {
 			advisory_id INTEGER NOT NULL,
 			PRIMARY KEY (repo_id, alert_number)
 		);`,
-		`CREATE TABLE IF NOT EXISTS security_advisory_vulnerabilities (
+		`CREATE TABLE IF NOT EXISTS advisory_vulnerabilities (
 			advisory_id INTEGER NOT NULL,
 			package_key_id INTEGER NOT NULL,
 			package_ordinal INTEGER NOT NULL,
@@ -205,7 +197,7 @@ func initSQLite(db *sql.DB) error {
 			reference_id INTEGER PRIMARY KEY AUTOINCREMENT,
 			url TEXT NOT NULL UNIQUE
 		);`,
-		`CREATE TABLE IF NOT EXISTS security_advisory_references (
+		`CREATE TABLE IF NOT EXISTS advisory_reference_links (
 			advisory_id INTEGER NOT NULL,
 			reference_id INTEGER NOT NULL,
 			ref_num INTEGER NOT NULL,
@@ -215,7 +207,7 @@ func initSQLite(db *sql.DB) error {
 			cwe_id TEXT PRIMARY KEY,
 			name TEXT
 		);`,
-		`CREATE TABLE IF NOT EXISTS security_advisory_cwes (
+		`CREATE TABLE IF NOT EXISTS advisory_cwes (
 			advisory_id INTEGER NOT NULL,
 			cwe_id TEXT NOT NULL,
 			PRIMARY KEY (advisory_id, cwe_id)
@@ -235,12 +227,6 @@ func initSQLite(db *sql.DB) error {
 			dismissed_at TEXT,
 			dismissed_reason TEXT,
 			dismissed_comment TEXT,
-			PRIMARY KEY (repo_id, alert_number)
-		);`,
-		`CREATE TABLE IF NOT EXISTS code_scanning_alert_instances (
-			repo_id INTEGER NOT NULL,
-			alert_number INTEGER NOT NULL,
-			ordinal INTEGER NOT NULL,
 			ref TEXT,
 			commit_sha TEXT,
 			path TEXT,
@@ -248,14 +234,13 @@ func initSQLite(db *sql.DB) error {
 			end_line INTEGER,
 			start_column INTEGER,
 			end_column INTEGER,
-			state TEXT,
+			most_recent_state TEXT,
 			category TEXT,
 			classifications TEXT,
 			analysis_key TEXT,
-			environment TEXT,
-			PRIMARY KEY (repo_id, alert_number, ordinal)
+			PRIMARY KEY (repo_id, alert_number)
 		);`,
-		`CREATE TABLE IF NOT EXISTS secret_scanning_alerts (
+		`CREATE TABLE IF NOT EXISTS secret_alerts (
 			repo_id INTEGER NOT NULL,
 			alert_number INTEGER NOT NULL,
 			state TEXT,
@@ -279,12 +264,6 @@ func initSQLite(db *sql.DB) error {
 			push_protection_bypass_request_html_url TEXT,
 			validity TEXT,
 			has_more_locations INTEGER,
-			PRIMARY KEY (repo_id, alert_number)
-		);`,
-		`CREATE TABLE IF NOT EXISTS secret_scanning_alert_locations (
-			repo_id INTEGER NOT NULL,
-			alert_number INTEGER NOT NULL,
-			ordinal INTEGER NOT NULL,
 			path TEXT,
 			start_line INTEGER,
 			end_line INTEGER,
@@ -295,7 +274,7 @@ func initSQLite(db *sql.DB) error {
 			commit_sha TEXT,
 			commit_url TEXT,
 			pull_request_comment_url TEXT,
-			PRIMARY KEY (repo_id, alert_number, ordinal)
+			PRIMARY KEY (repo_id, alert_number)
 		);`,
 	}
 
@@ -307,32 +286,41 @@ func applySchemaMigrations(db *sql.DB) error {
 	drops := []string{
 		"secret_scanning_alert_locations",
 		"secret_scanning_alerts",
+		"secret_alerts",
 		"code_scanning_rule_tags",
 		"code_scanning_tags",
 		"code_scanning_alert_instances",
 		"code_scanning_rules",
 		"code_scanning_tools",
 		"code_scanning_alerts",
+		"advisory_cwes",
 		"security_advisory_cwes",
 		"cwes",
+		"advisory_reference_links",
 		"security_advisory_references",
 		"advisory_references",
 		"security_advisory_identifiers",
 		"advisory_identifiers",
+		"advisory_vulnerabilities",
 		"security_advisory_vulnerabilities",
 		"dependabot_alert_advisories",
+		"advisories",
 		"security_advisories",
 		"dependabot_security_advisories",
 		"dependabot_alerts",
 		"sbom_relationships",
 		"sbom_package_external_refs",
+		"sbom_packages",
 		"sbom_document_packages",
+		"sbom",
 		"sbom_document_describes",
 		"sbom_documents",
 		"repo_packages",
 		"repo_package_versions",
 		"package_versions",
 		"packages",
+		"repo_scanners",
+		"scanners",
 		"repo_sast_scanners",
 		"licenses",
 		"repo_merge_policies",

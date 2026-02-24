@@ -280,13 +280,6 @@ func mostRecentAnalysisKey(inst *github.MostRecentInstance) string {
 	return inst.GetAnalysisKey()
 }
 
-func mostRecentEnvironment(inst *github.MostRecentInstance) string {
-	if inst == nil {
-		return ""
-	}
-	return inst.GetEnvironment()
-}
-
 func repoIDKey(repoID int64) string {
 	return fmt.Sprintf("id:%d", repoID)
 }
@@ -306,28 +299,42 @@ func extractImmerseCustomProperties(customProps map[string]any) (string, string,
 	return askID, jfrogProjectKey, sastCompliant, scanners
 }
 
-func upsertRepoSASTScanners(db *sql.DB, repoID int64, scanners []string) error {
-	if _, err := db.Exec(`DELETE FROM repo_sast_scanners WHERE repo_id = ?`, repoID); err != nil {
+func upsertRepoScanners(db *sql.DB, repoID int64, scanners []string) error {
+	if _, err := db.Exec(`DELETE FROM repo_scanners WHERE repo_id = ?`, repoID); err != nil {
 		return err
 	}
 	if len(scanners) == 0 {
 		return nil
 	}
 
-	args := make([]interface{}, 0, len(scanners)*2)
-	var sqlBuilder strings.Builder
-	sqlBuilder.WriteString(`INSERT INTO repo_sast_scanners(repo_id, scanner) VALUES `)
-	for i, scanner := range scanners {
-		if i > 0 {
-			sqlBuilder.WriteString(", ")
+	seen := make(map[string]struct{}, len(scanners))
+	for _, scanner := range scanners {
+		scanner = strings.TrimSpace(scanner)
+		if scanner == "" {
+			continue
 		}
-		sqlBuilder.WriteString("(?, ?)")
-		args = append(args, repoID, scanner)
+		if _, ok := seen[scanner]; ok {
+			continue
+		}
+		seen[scanner] = struct{}{}
+		if _, err := db.Exec(`
+			INSERT INTO scanners(scanner)
+			VALUES (?)
+			ON CONFLICT(scanner) DO NOTHING
+		`, scanner); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`
+			INSERT INTO repo_scanners(repo_id, scanner_id)
+			SELECT ?, scanner_id
+			FROM scanners
+			WHERE scanner = ?
+			ON CONFLICT(repo_id, scanner_id) DO NOTHING
+		`, repoID, scanner); err != nil {
+			return err
+		}
 	}
-	sqlBuilder.WriteString(` ON CONFLICT(repo_id, scanner) DO NOTHING`)
-
-	_, err := db.Exec(sqlBuilder.String(), args...)
-	return err
+	return nil
 }
 
 func toTrimmedString(v any) string {
