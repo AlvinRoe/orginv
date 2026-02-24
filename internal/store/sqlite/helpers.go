@@ -252,6 +252,14 @@ func nullableIntPtr(v *int) interface{} {
 	return *v
 }
 
+func nullableString(v string) interface{} {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil
+	}
+	return v
+}
+
 func floatPtrToValue(v *float64) interface{} {
 	if v == nil {
 		return nil

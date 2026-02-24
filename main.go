@@ -8,7 +8,6 @@ import (
 	githubclient "github.com/AlvinRoe/orginv/internal/clients/github"
 	"github.com/AlvinRoe/orginv/internal/config"
 	"github.com/AlvinRoe/orginv/internal/orchestrator"
-	"github.com/AlvinRoe/orginv/internal/report"
 	"github.com/AlvinRoe/orginv/internal/store/sqlite"
 	_ "modernc.org/sqlite"
 )
@@ -29,8 +28,7 @@ func main() {
 	defer db.Close()
 
 	store := sqlite.New(db)
-	exporter := report.NewExporter(store)
-	runner := orchestrator.NewRunner(cfg, client, store, exporter)
+	runner := orchestrator.NewRunner(cfg, client, store)
 
 	if err := runner.Bootstrap(ctx); err != nil {
 		log.Fatal(err)

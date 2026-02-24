@@ -118,7 +118,7 @@ func upsertRepo(db *sql.DB, org string, repo *github.Repository) error {
 		boolToInt(repo.GetAllowAutoMerge()), boolToInt(repo.GetAllowForking()), boolToInt(repo.GetWebCommitSignoffRequired()), boolToInt(repo.GetDeleteBranchOnMerge()),
 		boolToInt(repo.GetUseSquashPRTitleAsDefault()), boolToInt(repo.GetHasDownloads()),
 		secretScanningValidityChecksStatus, nullableInt64Value(repo.GetTeamID()),
-		immerseAskID, immerseJFrogProjectKey, immerseSASTCompliant,
+		nullableString(immerseAskID), immerseJFrogProjectKey, immerseSASTCompliant,
 		repo.GetID(),
 	)
 	if err != nil {

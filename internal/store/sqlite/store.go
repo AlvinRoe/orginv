@@ -69,8 +69,3 @@ func (s *Store) IngestSecretScanningAlerts(ctx context.Context, repoIDByName Rep
 	_ = ctx
 	return ingestSecretScanningAlerts(s.db, repoIDByName, alerts)
 }
-
-func (s *Store) ExportCSVReport(ctx context.Context, outputPath string) error {
-	_ = ctx
-	return exportCSVReport(s.db, outputPath)
-}

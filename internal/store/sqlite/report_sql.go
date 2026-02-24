@@ -1,12 +1,12 @@
 package sqlite
 
 import (
-	"database/sql"
+	"context"
 	"encoding/csv"
 	"os"
 )
 
-func exportCSVReport(db *sql.DB, outputPath string) error {
+func (s *Store) ExportCSVReport(ctx context.Context, outputPath string) error {
 	query := `
 		SELECT
 			r.repo_id,
@@ -126,7 +126,7 @@ func exportCSVReport(db *sql.DB, outputPath string) error {
 		ORDER BY open_critical_dependabot_alerts DESC, open_dependabot_alerts DESC, r.full_name ASC
 	`
 
-	rows, err := db.Query(query)
+	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return err
 	}

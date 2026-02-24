@@ -8,9 +8,7 @@ import (
 	"sync"
 	"time"
 
-	githubclient "github.com/AlvinRoe/orginv/internal/clients/github"
 	"github.com/AlvinRoe/orginv/internal/config"
-	"github.com/AlvinRoe/orginv/internal/report"
 	"github.com/AlvinRoe/orginv/internal/store/sqlite"
 	gogithub "github.com/google/go-github/v82/github"
 )
@@ -18,10 +16,9 @@ import (
 const repoWorkers = 10
 
 type Runner struct {
-	cfg      config.Config
-	client   *githubclient.Client
-	store    *sqlite.Store
-	exporter *report.Exporter
+	cfg    config.Config
+	client RepoFetcher
+	store  Store
 }
 
 type RepoLoadResult struct {
@@ -49,8 +46,26 @@ type fetchCollector struct {
 	errors   []string
 }
 
-func NewRunner(cfg config.Config, client *githubclient.Client, store *sqlite.Store, exporter *report.Exporter) *Runner {
-	return &Runner{cfg: cfg, client: client, store: store, exporter: exporter}
+type RepoFetcher interface {
+	FetchAllRepos(ctx context.Context, org string, perPage int) ([]*gogithub.Repository, error)
+	FetchDependabotAlerts(ctx context.Context, org string, perPage int) ([]*gogithub.DependabotAlert, int, error)
+	FetchCodeScanningAlerts(ctx context.Context, org string, perPage int) ([]*gogithub.Alert, int, error)
+	FetchSecretScanningAlerts(ctx context.Context, org string, perPage int) ([]*gogithub.SecretScanningAlert, int, error)
+	FetchSBOM(ctx context.Context, org, repo string) (*gogithub.SBOM, error)
+}
+
+type Store interface {
+	InitSchema(ctx context.Context) error
+	UpsertRepos(ctx context.Context, org string, repos []*gogithub.Repository) (sqlite.RepoIndex, []*gogithub.Repository, error)
+	IngestSBOM(ctx context.Context, repoID int64, sbom *gogithub.SBOM) error
+	IngestDependabotAlerts(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.DependabotAlert) error
+	IngestCodeScanningAlerts(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.Alert) error
+	IngestSecretScanningAlerts(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.SecretScanningAlert) error
+	ExportCSVReport(ctx context.Context, outputPath string) error
+}
+
+func NewRunner(cfg config.Config, client RepoFetcher, store Store) *Runner {
+	return &Runner{cfg: cfg, client: client, store: store}
 }
 
 func (r *Runner) Bootstrap(ctx context.Context) error {
@@ -245,7 +260,7 @@ func (r *Runner) ExecuteWrites(ctx context.Context, fetchResult DatasetFetchResu
 }
 
 func (r *Runner) ExportReport(ctx context.Context) error {
-	if err := r.exporter.ExportCSV(ctx, r.cfg.CSVOutputPath); err != nil {
+	if err := r.store.ExportCSVReport(ctx, r.cfg.CSVOutputPath); err != nil {
 		return fmt.Errorf("failed to export csv report: %w", err)
 	}
 	return nil
