@@ -2,7 +2,7 @@ package sqlite
 
 import (
 	"database/sql"
-	"fmt"
+	"strings"
 )
 
 func initSQLite(db *sql.DB) error {
@@ -299,12 +299,8 @@ func initSQLite(db *sql.DB) error {
 		);`,
 	}
 
-	for _, stmt := range schema {
-		if _, err := db.Exec(stmt); err != nil {
-			return err
-		}
-	}
-	return nil
+	_, err := db.Exec(strings.Join(schema, "\n"))
+	return err
 }
 
 func applySchemaMigrations(db *sql.DB) error {
@@ -352,17 +348,15 @@ func applySchemaMigrations(db *sql.DB) error {
 		"repo_dependencies",
 		"dependencies",
 	}
-	if _, err := db.Exec(`PRAGMA foreign_keys = OFF;`); err != nil {
-		return err
-	}
+	var migrationSQL strings.Builder
+	migrationSQL.WriteString("PRAGMA foreign_keys = OFF;\n")
 	for _, table := range drops {
-		if _, err := db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", table)); err != nil {
-			return err
-		}
+		migrationSQL.WriteString("DROP TABLE IF EXISTS ")
+		migrationSQL.WriteString(table)
+		migrationSQL.WriteString(";\n")
 	}
-	_, err := db.Exec(`PRAGMA foreign_keys = ON;`)
-	if err != nil {
-		return err
-	}
-	return nil
+	migrationSQL.WriteString("PRAGMA foreign_keys = ON;")
+
+	_, err := db.Exec(migrationSQL.String())
+	return err
 }

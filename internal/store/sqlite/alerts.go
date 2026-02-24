@@ -321,18 +321,44 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAl
 		}
 	}
 
-	for _, table := range []string{
-		"security_advisory_vulnerabilities",
-		"security_advisory_references",
-		"security_advisory_cwes",
-	} {
-		if _, err := tx.Exec(
-			fmt.Sprintf("DELETE FROM %s WHERE advisory_id = ?", table),
-			advisoryID,
-		); err != nil {
-			return err
-		}
+	if _, err := tx.Exec(`
+		DELETE FROM security_advisory_vulnerabilities WHERE advisory_id = ?;
+		DELETE FROM security_advisory_references WHERE advisory_id = ?;
+		DELETE FROM security_advisory_cwes WHERE advisory_id = ?;
+	`, advisoryID, advisoryID, advisoryID); err != nil {
+		return err
 	}
+
+	vulnStmt, err := tx.Prepare(`
+		INSERT INTO security_advisory_vulnerabilities(
+			advisory_id, package_key_id, package_ordinal, severity, vulnerable_version_range,
+			first_patched_version
+		) VALUES (?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return err
+	}
+	defer vulnStmt.Close()
+
+	advRefStmt, err := tx.Prepare(`
+		INSERT INTO security_advisory_references(advisory_id, reference_id, ref_num)
+		VALUES (?, ?, ?)
+		ON CONFLICT(advisory_id, reference_id) DO NOTHING
+	`)
+	if err != nil {
+		return err
+	}
+	defer advRefStmt.Close()
+
+	advCWEStmt, err := tx.Prepare(`
+		INSERT INTO security_advisory_cwes(advisory_id, cwe_id)
+		VALUES (?, ?)
+		ON CONFLICT(advisory_id, cwe_id) DO NOTHING
+	`)
+	if err != nil {
+		return err
+	}
+	defer advCWEStmt.Close()
 
 	packageOrdinals := make(map[int64]int)
 	for _, v := range adv.Vulnerabilities {
@@ -350,12 +376,7 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAl
 		}
 		packageOrdinals[packageKeyID]++
 		packageOrdinal := packageOrdinals[packageKeyID]
-		_, err = tx.Exec(`
-				INSERT INTO security_advisory_vulnerabilities(
-					advisory_id, package_key_id, package_ordinal, severity, vulnerable_version_range,
-					first_patched_version
-				) VALUES (?, ?, ?, ?, ?, ?)
-			`, advisoryID, packageKeyID, packageOrdinal, v.GetSeverity(),
+		_, err = vulnStmt.Exec(advisoryID, packageKeyID, packageOrdinal, v.GetSeverity(),
 			v.GetVulnerableVersionRange(), v.GetFirstPatchedVersion().GetIdentifier())
 		if err != nil {
 			return err
@@ -370,11 +391,7 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAl
 		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(`
-				INSERT INTO security_advisory_references(advisory_id, reference_id, ref_num)
-				VALUES (?, ?, ?)
-				ON CONFLICT(advisory_id, reference_id) DO NOTHING
-			`, advisoryID, referenceID, i+1)
+		_, err = advRefStmt.Exec(advisoryID, referenceID, i+1)
 		if err != nil {
 			return err
 		}
@@ -391,11 +408,7 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAl
 		if err := upsertCWETx(tx, cweID, cwe.GetName()); err != nil {
 			return err
 		}
-		_, err := tx.Exec(`
-				INSERT INTO security_advisory_cwes(advisory_id, cwe_id)
-				VALUES (?, ?)
-				ON CONFLICT(advisory_id, cwe_id) DO NOTHING
-			`, advisoryID, cweID)
+		_, err := advCWEStmt.Exec(advisoryID, cweID)
 		if err != nil {
 			return err
 		}

@@ -310,16 +310,24 @@ func upsertRepoSASTScanners(db *sql.DB, repoID int64, scanners []string) error {
 	if _, err := db.Exec(`DELETE FROM repo_sast_scanners WHERE repo_id = ?`, repoID); err != nil {
 		return err
 	}
-	for _, scanner := range scanners {
-		if _, err := db.Exec(`
-			INSERT INTO repo_sast_scanners(repo_id, scanner)
-			VALUES (?, ?)
-			ON CONFLICT(repo_id, scanner) DO NOTHING
-		`, repoID, scanner); err != nil {
-			return err
-		}
+	if len(scanners) == 0 {
+		return nil
 	}
-	return nil
+
+	args := make([]interface{}, 0, len(scanners)*2)
+	var sqlBuilder strings.Builder
+	sqlBuilder.WriteString(`INSERT INTO repo_sast_scanners(repo_id, scanner) VALUES `)
+	for i, scanner := range scanners {
+		if i > 0 {
+			sqlBuilder.WriteString(", ")
+		}
+		sqlBuilder.WriteString("(?, ?)")
+		args = append(args, repoID, scanner)
+	}
+	sqlBuilder.WriteString(` ON CONFLICT(repo_id, scanner) DO NOTHING`)
+
+	_, err := db.Exec(sqlBuilder.String(), args...)
+	return err
 }
 
 func toTrimmedString(v any) string {
