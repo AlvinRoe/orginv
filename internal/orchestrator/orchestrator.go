@@ -24,6 +24,16 @@ type Runner struct {
 	exporter *report.Exporter
 }
 
+type RepoLoadResult struct {
+	RepoIDByName sqlite.RepoIndex
+	ActiveRepos  []*gogithub.Repository
+}
+
+type DatasetFetchResult struct {
+	WriteOps []dbWriteOp
+	Errors   []string
+}
+
 type dbWriteOp struct {
 	name     string
 	priority int
@@ -31,23 +41,16 @@ type dbWriteOp struct {
 	apply    func(context.Context) error
 }
 
-type State struct {
-	repoIDByName sqlite.RepoIndex
-	activeRepos  []*gogithub.Repository
-	writeOps     []dbWriteOp
-
-	errorsMu   sync.Mutex
-	errorsSeen []string
-
+type fetchCollector struct {
 	writeOpsMu sync.Mutex
+	writeOps   []dbWriteOp
+
+	errorsMu sync.Mutex
+	errors   []string
 }
 
 func NewRunner(cfg config.Config, client *githubclient.Client, store *sqlite.Store, exporter *report.Exporter) *Runner {
 	return &Runner{cfg: cfg, client: client, store: store, exporter: exporter}
-}
-
-func NewState() *State {
-	return &State{writeOps: make([]dbWriteOp, 0)}
 }
 
 func (r *Runner) Bootstrap(ctx context.Context) error {
@@ -57,34 +60,43 @@ func (r *Runner) Bootstrap(ctx context.Context) error {
 	return nil
 }
 
-func (r *Runner) LoadRepoBaseline(ctx context.Context, state *State) error {
+func (r *Runner) LoadRepos(ctx context.Context) (RepoLoadResult, error) {
 	repos, err := r.client.FetchAllRepos(ctx, r.cfg.Org, r.cfg.ResultsPerPage)
 	if err != nil {
-		return fmt.Errorf("failed to fetch repositories: %w", err)
+		return RepoLoadResult{}, fmt.Errorf("failed to fetch repositories: %w", err)
 	}
 	log.Printf("found %d repos", len(repos))
 
 	repoIDByName, activeRepos, err := r.store.UpsertRepos(ctx, r.cfg.Org, repos)
 	if err != nil {
-		return fmt.Errorf("failed to persist repositories: %w", err)
+		return RepoLoadResult{}, fmt.Errorf("failed to persist repositories: %w", err)
 	}
 
-	state.repoIDByName = repoIDByName
-	state.activeRepos = activeRepos
-	state.writeOps = make([]dbWriteOp, 0, len(activeRepos)*2+3)
 	log.Printf("active repos: %d", len(activeRepos))
-	return nil
+	return RepoLoadResult{
+		RepoIDByName: repoIDByName,
+		ActiveRepos:  activeRepos,
+	}, nil
 }
 
-func (r *Runner) FetchDatasets(ctx context.Context, state *State) {
+func (r *Runner) FetchDatasets(ctx context.Context, repos RepoLoadResult) DatasetFetchResult {
+	collector := &fetchCollector{
+		writeOps: make([]dbWriteOp, 0, len(repos.ActiveRepos)*2+3),
+	}
+
 	log.Printf("stage ingestion: fetching org-level alert datasets")
-	r.fetchOrgAlertDatasets(ctx, state)
+	r.fetchOrgAlertDatasets(ctx, repos, collector)
 
 	log.Printf("stage ingestion: fetching per-repo datasets (sbom)")
-	r.fetchSBOMDatasets(ctx, state)
+	r.fetchSBOMDatasets(ctx, repos.ActiveRepos, collector)
+
+	return DatasetFetchResult{
+		WriteOps: collector.writeOps,
+		Errors:   collector.errors,
+	}
 }
 
-func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, state *State) {
+func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, repos RepoLoadResult, collector *fetchCollector) {
 	var orgWG sync.WaitGroup
 	orgFetch := []struct {
 		name string
@@ -98,12 +110,12 @@ func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, state *State) {
 					return err
 				}
 				log.Printf("dependabot fetch complete: pages=%d alerts=%d", pages, len(alerts))
-				state.enqueueWriteOp(dbWriteOp{
+				collector.enqueueWriteOp(dbWriteOp{
 					name:     "dependabot alerts",
 					priority: 30,
 					rows:     len(alerts),
 					apply: func(ctx context.Context) error {
-						return r.store.IngestDependabotAlerts(ctx, state.repoIDByName, alerts)
+						return r.store.IngestDependabotAlerts(ctx, repos.RepoIDByName, alerts)
 					},
 				})
 				return nil
@@ -117,12 +129,12 @@ func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, state *State) {
 					return err
 				}
 				log.Printf("code scanning fetch complete: pages=%d alerts=%d", pages, len(alerts))
-				state.enqueueWriteOp(dbWriteOp{
+				collector.enqueueWriteOp(dbWriteOp{
 					name:     "code scanning alerts",
 					priority: 30,
 					rows:     len(alerts),
 					apply: func(ctx context.Context) error {
-						return r.store.IngestCodeScanningAlerts(ctx, state.repoIDByName, alerts)
+						return r.store.IngestCodeScanningAlerts(ctx, repos.RepoIDByName, alerts)
 					},
 				})
 				return nil
@@ -136,12 +148,12 @@ func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, state *State) {
 					return err
 				}
 				log.Printf("secret scanning fetch complete: pages=%d alerts=%d", pages, len(alerts))
-				state.enqueueWriteOp(dbWriteOp{
+				collector.enqueueWriteOp(dbWriteOp{
 					name:     "secret scanning alerts",
 					priority: 30,
 					rows:     len(alerts),
 					apply: func(ctx context.Context) error {
-						return r.store.IngestSecretScanningAlerts(ctx, state.repoIDByName, alerts)
+						return r.store.IngestSecretScanningAlerts(ctx, repos.RepoIDByName, alerts)
 					},
 				})
 				return nil
@@ -156,7 +168,7 @@ func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, state *State) {
 			started := time.Now()
 			log.Printf("%s fetch started", taskName)
 			if err := run(); err != nil {
-				state.recordErr(fmt.Sprintf("%s ingestion failed", taskName), err)
+				collector.recordErr(fmt.Sprintf("%s ingestion failed", taskName), err)
 				return
 			}
 			log.Printf("%s fetch/build done in %s", taskName, time.Since(started))
@@ -165,8 +177,8 @@ func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, state *State) {
 	orgWG.Wait()
 }
 
-func (r *Runner) fetchSBOMDatasets(ctx context.Context, state *State) {
-	repoChan := make(chan *gogithub.Repository, len(state.activeRepos))
+func (r *Runner) fetchSBOMDatasets(ctx context.Context, activeRepos []*gogithub.Repository, collector *fetchCollector) {
+	repoChan := make(chan *gogithub.Repository, len(activeRepos))
 	var repoWG sync.WaitGroup
 
 	for i := 0; i < repoWorkers; i++ {
@@ -181,9 +193,9 @@ func (r *Runner) fetchSBOMDatasets(ctx context.Context, state *State) {
 
 				sbom, sbomErr := r.client.FetchSBOM(ctx, r.cfg.Org, repoName)
 				if sbomErr != nil {
-					state.recordErr(fmt.Sprintf("worker %d sbom %s", workerID, repoName), sbomErr)
+					collector.recordErr(fmt.Sprintf("worker %d sbom %s", workerID, repoName), sbomErr)
 				} else {
-					state.enqueueWriteOp(dbWriteOp{
+					collector.enqueueWriteOp(dbWriteOp{
 						name:     fmt.Sprintf("sbom %s", repoName),
 						priority: 10,
 						rows:     1,
@@ -198,31 +210,38 @@ func (r *Runner) fetchSBOMDatasets(ctx context.Context, state *State) {
 		}(i + 1)
 	}
 
-	for _, repo := range state.activeRepos {
+	for _, repo := range activeRepos {
 		repoChan <- repo
 	}
 	close(repoChan)
 	repoWG.Wait()
 }
 
-func (r *Runner) ExecuteWrites(ctx context.Context, state *State) {
-	log.Printf("stage writes: queued db operations=%d", len(state.writeOps))
-	sort.SliceStable(state.writeOps, func(i, j int) bool {
-		if state.writeOps[i].priority == state.writeOps[j].priority {
-			return state.writeOps[i].name < state.writeOps[j].name
+func (r *Runner) ExecuteWrites(ctx context.Context, fetchResult DatasetFetchResult) []string {
+	writeOps := append([]dbWriteOp(nil), fetchResult.WriteOps...)
+	errorsSeen := append([]string(nil), fetchResult.Errors...)
+
+	log.Printf("stage writes: queued db operations=%d", len(writeOps))
+	sort.SliceStable(writeOps, func(i, j int) bool {
+		if writeOps[i].priority == writeOps[j].priority {
+			return writeOps[i].name < writeOps[j].name
 		}
-		return state.writeOps[i].priority < state.writeOps[j].priority
+		return writeOps[i].priority < writeOps[j].priority
 	})
 
-	for idx, op := range state.writeOps {
+	for idx, op := range writeOps {
 		started := time.Now()
-		log.Printf("db queue %d/%d start: %s (rows=%d)", idx+1, len(state.writeOps), op.name, op.rows)
+		log.Printf("db queue %d/%d start: %s (rows=%d)", idx+1, len(writeOps), op.name, op.rows)
 		if err := op.apply(ctx); err != nil {
-			state.recordErr(fmt.Sprintf("db write failed: %s", op.name), err)
+			msg := fmt.Sprintf("db write failed: %s: %v", op.name, err)
+			errorsSeen = append(errorsSeen, msg)
+			log.Printf("%s", msg)
 			continue
 		}
-		log.Printf("db queue %d/%d done: %s in %s", idx+1, len(state.writeOps), op.name, time.Since(started))
+		log.Printf("db queue %d/%d done: %s in %s", idx+1, len(writeOps), op.name, time.Since(started))
 	}
+
+	return errorsSeen
 }
 
 func (r *Runner) ExportReport(ctx context.Context) error {
@@ -232,24 +251,24 @@ func (r *Runner) ExportReport(ctx context.Context) error {
 	return nil
 }
 
-func (r *Runner) Finalize(state *State) {
-	if len(state.errorsSeen) > 0 {
-		log.Printf("completed with %d ingestion errors (see logs)", len(state.errorsSeen))
+func (r *Runner) Finalize(errorsSeen []string) {
+	if len(errorsSeen) > 0 {
+		log.Printf("completed with %d ingestion errors (see logs)", len(errorsSeen))
 	}
 	log.Printf("phase 1 complete")
 	log.Printf("sqlite output: %s", r.cfg.SQLitePath)
 	log.Printf("csv output: %s", r.cfg.CSVOutputPath)
 }
 
-func (s *State) recordErr(msg string, err error) {
-	s.errorsMu.Lock()
-	defer s.errorsMu.Unlock()
-	s.errorsSeen = append(s.errorsSeen, fmt.Sprintf("%s: %v", msg, err))
+func (c *fetchCollector) recordErr(msg string, err error) {
+	c.errorsMu.Lock()
+	defer c.errorsMu.Unlock()
+	c.errors = append(c.errors, fmt.Sprintf("%s: %v", msg, err))
 	log.Printf("%s: %v", msg, err)
 }
 
-func (s *State) enqueueWriteOp(op dbWriteOp) {
-	s.writeOpsMu.Lock()
-	s.writeOps = append(s.writeOps, op)
-	s.writeOpsMu.Unlock()
+func (c *fetchCollector) enqueueWriteOp(op dbWriteOp) {
+	c.writeOpsMu.Lock()
+	c.writeOps = append(c.writeOps, op)
+	c.writeOpsMu.Unlock()
 }

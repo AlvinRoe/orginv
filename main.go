@@ -31,18 +31,18 @@ func main() {
 	store := sqlite.New(db)
 	exporter := report.NewExporter(store)
 	runner := orchestrator.NewRunner(cfg, client, store, exporter)
-	state := orchestrator.NewState()
 
 	if err := runner.Bootstrap(ctx); err != nil {
 		log.Fatal(err)
 	}
-	if err := runner.LoadRepoBaseline(ctx, state); err != nil {
+	repos, err := runner.LoadRepos(ctx)
+	if err != nil {
 		log.Fatal(err)
 	}
-	runner.FetchDatasets(ctx, state)
-	runner.ExecuteWrites(ctx, state)
+	fetchResult := runner.FetchDatasets(ctx, repos)
+	errorsSeen := runner.ExecuteWrites(ctx, fetchResult)
 	if err := runner.ExportReport(ctx); err != nil {
 		log.Fatal(err)
 	}
-	runner.Finalize(state)
+	runner.Finalize(errorsSeen)
 }
