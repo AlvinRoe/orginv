@@ -12,6 +12,7 @@ type Config struct {
 	ResultsPerPage int
 	SQLitePath     string
 	CSVOutputPath  string
+	ReportSQLPath  string
 }
 
 func LoadFromEnv() (Config, error) {
@@ -44,11 +45,17 @@ func LoadFromEnv() (Config, error) {
 		csvPath = "./orginv-report.csv"
 	}
 
+	reportSQLPath := os.Getenv("REPORT_SQL_PATH")
+	if reportSQLPath == "" {
+		reportSQLPath = "./internal/sql/default_report.sql"
+	}
+
 	return Config{
 		Org:            org,
 		Token:          token,
 		ResultsPerPage: perPage,
 		SQLitePath:     sqlitePath,
 		CSVOutputPath:  csvPath,
+		ReportSQLPath:  reportSQLPath,
 	}, nil
 }

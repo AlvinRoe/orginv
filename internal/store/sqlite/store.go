@@ -8,13 +8,22 @@ import (
 )
 
 type Store struct {
-	db *sql.DB
+	db            *sql.DB
+	reportSQLPath string
 }
 
 type RepoIndex map[string]int64
 
-func New(db *sql.DB) *Store {
-	return &Store{db: db}
+const defaultReportSQLPath = "./internal/sql/default_report.sql"
+
+func New(db *sql.DB, reportSQLPath string) *Store {
+	if reportSQLPath == "" {
+		reportSQLPath = defaultReportSQLPath
+	}
+	return &Store{
+		db:            db,
+		reportSQLPath: reportSQLPath,
+	}
 }
 
 func (s *Store) DB() *sql.DB {

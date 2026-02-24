@@ -27,7 +27,7 @@ func main() {
 	}
 	defer db.Close()
 
-	store := sqlite.New(db)
+	store := sqlite.New(db, cfg.ReportSQLPath)
 	runner := orchestrator.NewRunner(cfg, client, store)
 
 	if err := runner.Bootstrap(ctx); err != nil {
