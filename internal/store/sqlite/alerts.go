@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -9,14 +10,14 @@ import (
 	"github.com/google/go-github/v82/github"
 )
 
-func ingestDependabotAlerts(db *sql.DB, repoIDByName map[string]int64, alerts []*github.DependabotAlert) error {
-	tx, err := db.Begin()
+func (s *Store) IngestDependabotAlerts(ctx context.Context, repoIDByName RepoIndex, alerts []*github.DependabotAlert) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.Prepare(`
+	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO dependabot_alerts(
 			repo_id, alert_number, state, severity, package_id, manifest_path, created_at,
 			updated_at, fixed_at, dismissed_reason, url, html_url, dismissed_at, dismissed_comment,
@@ -69,7 +70,8 @@ func ingestDependabotAlerts(db *sql.DB, repoIDByName map[string]int64, alerts []
 			return depErr
 		}
 
-		_, err = stmt.Exec(
+		_, err = stmt.ExecContext(
+			ctx,
 			repoID,
 			a.GetNumber(),
 			a.GetState(),
@@ -100,14 +102,14 @@ func ingestDependabotAlerts(db *sql.DB, repoIDByName map[string]int64, alerts []
 	return tx.Commit()
 }
 
-func ingestCodeScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts []*github.Alert) error {
-	tx, err := db.Begin()
+func (s *Store) IngestCodeScanningAlerts(ctx context.Context, repoIDByName RepoIndex, alerts []*github.Alert) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.Prepare(`
+	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO code_scanning_alerts(
 			repo_id, alert_number, state, severity,
 			created_at, fixed_at, updated_at, closed_at, url, html_url, instances_url, dismissed_at, dismissed_reason, dismissed_comment,
@@ -155,7 +157,8 @@ func ingestCodeScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts 
 			continue
 		}
 		snapshot := snapshotCodeScanningInstance(a.GetMostRecentInstance())
-		_, err = stmt.Exec(
+		_, err = stmt.ExecContext(
+			ctx,
 			repoID,
 			a.GetNumber(),
 			a.GetState(),
@@ -192,14 +195,14 @@ func ingestCodeScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts 
 	return tx.Commit()
 }
 
-func ingestSecretScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alerts []*github.SecretScanningAlert) error {
-	tx, err := db.Begin()
+func (s *Store) IngestSecretScanningAlerts(ctx context.Context, repoIDByName RepoIndex, alerts []*github.SecretScanningAlert) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.Prepare(`
+	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO secret_alerts(
 			repo_id, alert_number, state, secret_type, resolution, created_at, updated_at, resolved_at,
 			url, html_url, locations_url, secret_type_display_name, secret, is_base64_encoded, multi_repo, publicly_leaked,
@@ -282,7 +285,8 @@ func ingestSecretScanningAlerts(db *sql.DB, repoIDByName map[string]int64, alert
 			commitURL = loc.GetCommitURL()
 			pullRequestCommentURL = loc.GetPullRequestCommentURL()
 		}
-		_, err := stmt.Exec(
+		_, err := stmt.ExecContext(
+			ctx,
 			repoID,
 			a.GetNumber(),
 			a.GetState(),

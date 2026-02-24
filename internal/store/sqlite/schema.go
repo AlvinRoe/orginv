@@ -1,12 +1,13 @@
 package sqlite
 
 import (
+	"context"
 	"database/sql"
 	"strings"
 )
 
-func initSQLite(db *sql.DB) error {
-	if err := applySchemaMigrations(db); err != nil {
+func (s *Store) InitSchema(ctx context.Context) error {
+	if err := applySchemaMigrations(ctx, s.db); err != nil {
 		return err
 	}
 
@@ -278,11 +279,11 @@ func initSQLite(db *sql.DB) error {
 		);`,
 	}
 
-	_, err := db.Exec(strings.Join(schema, "\n"))
+	_, err := s.db.ExecContext(ctx, strings.Join(schema, "\n"))
 	return err
 }
 
-func applySchemaMigrations(db *sql.DB) error {
+func applySchemaMigrations(ctx context.Context, db *sql.DB) error {
 	drops := []string{
 		"secret_scanning_alert_locations",
 		"secret_scanning_alerts",
@@ -345,6 +346,6 @@ func applySchemaMigrations(db *sql.DB) error {
 	}
 	migrationSQL.WriteString("PRAGMA foreign_keys = ON;")
 
-	_, err := db.Exec(migrationSQL.String())
+	_, err := db.ExecContext(ctx, migrationSQL.String())
 	return err
 }

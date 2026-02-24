@@ -21,11 +21,6 @@ func (s *Store) DB() *sql.DB {
 	return s.db
 }
 
-func (s *Store) InitSchema(ctx context.Context) error {
-	_ = ctx
-	return initSQLite(s.db)
-}
-
 func (s *Store) UpsertRepos(ctx context.Context, org string, repos []*gogithub.Repository) (RepoIndex, []*gogithub.Repository, error) {
 	_ = ctx
 	repoIDByName := make(RepoIndex, len(repos)*2)
@@ -48,24 +43,4 @@ func (s *Store) UpsertRepos(ctx context.Context, org string, repos []*gogithub.R
 	}
 
 	return repoIDByName, activeRepos, nil
-}
-
-func (s *Store) IngestSBOM(ctx context.Context, repoID int64, sbom *gogithub.SBOM) error {
-	_ = ctx
-	return ingestSBOM(s.db, repoID, sbom)
-}
-
-func (s *Store) IngestDependabotAlerts(ctx context.Context, repoIDByName RepoIndex, alerts []*gogithub.DependabotAlert) error {
-	_ = ctx
-	return ingestDependabotAlerts(s.db, repoIDByName, alerts)
-}
-
-func (s *Store) IngestCodeScanningAlerts(ctx context.Context, repoIDByName RepoIndex, alerts []*gogithub.Alert) error {
-	_ = ctx
-	return ingestCodeScanningAlerts(s.db, repoIDByName, alerts)
-}
-
-func (s *Store) IngestSecretScanningAlerts(ctx context.Context, repoIDByName RepoIndex, alerts []*gogithub.SecretScanningAlert) error {
-	_ = ctx
-	return ingestSecretScanningAlerts(s.db, repoIDByName, alerts)
 }

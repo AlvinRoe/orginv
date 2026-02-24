@@ -2,11 +2,14 @@ package sqlite
 
 import (
 	"context"
-	"encoding/csv"
-	"os"
 )
 
-func (s *Store) ExportCSVReport(ctx context.Context, outputPath string) error {
+type ReportData struct {
+	Headers []string
+	Records [][]string
+}
+
+func (s *Store) QueryReportData(ctx context.Context) (ReportData, error) {
 	query := `
 		SELECT
 			r.repo_id,
@@ -128,27 +131,16 @@ func (s *Store) ExportCSVReport(ctx context.Context, outputPath string) error {
 
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
-		return err
+		return ReportData{}, err
 	}
 	defer rows.Close()
 
-	f, err := os.Create(outputPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	w := csv.NewWriter(f)
-	defer w.Flush()
-
 	headers, err := rows.Columns()
 	if err != nil {
-		return err
-	}
-	if err := w.Write(headers); err != nil {
-		return err
+		return ReportData{}, err
 	}
 
+	records := make([][]string, 0, 256)
 	for rows.Next() {
 		vals := make([]interface{}, len(headers))
 		valPtrs := make([]interface{}, len(headers))
@@ -156,18 +148,16 @@ func (s *Store) ExportCSVReport(ctx context.Context, outputPath string) error {
 			valPtrs[i] = &vals[i]
 		}
 		if err := rows.Scan(valPtrs...); err != nil {
-			return err
+			return ReportData{}, err
 		}
 		record := make([]string, len(headers))
 		for i, v := range vals {
 			record[i] = stringifyDBValue(v)
 		}
-		if err := w.Write(record); err != nil {
-			return err
-		}
+		records = append(records, record)
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return ReportData{}, err
 	}
-	return nil
+	return ReportData{Headers: headers, Records: records}, nil
 }

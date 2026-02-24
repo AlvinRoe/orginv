@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/AlvinRoe/orginv/internal/config"
+	"github.com/AlvinRoe/orginv/internal/exporter"
 	"github.com/AlvinRoe/orginv/internal/store/sqlite"
 	gogithub "github.com/google/go-github/v82/github"
 )
@@ -24,11 +25,6 @@ type Runner struct {
 type RepoLoadResult struct {
 	RepoIDByName sqlite.RepoIndex
 	ActiveRepos  []*gogithub.Repository
-}
-
-type DatasetFetchResult struct {
-	WriteOps []dbWriteOp
-	Errors   []string
 }
 
 type dbWriteOp struct {
@@ -61,7 +57,7 @@ type Store interface {
 	IngestDependabotAlerts(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.DependabotAlert) error
 	IngestCodeScanningAlerts(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.Alert) error
 	IngestSecretScanningAlerts(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.SecretScanningAlert) error
-	ExportCSVReport(ctx context.Context, outputPath string) error
+	QueryReportData(ctx context.Context) (sqlite.ReportData, error)
 }
 
 func NewRunner(cfg config.Config, client RepoFetcher, store Store) *Runner {
@@ -94,7 +90,7 @@ func (r *Runner) LoadRepos(ctx context.Context) (RepoLoadResult, error) {
 	}, nil
 }
 
-func (r *Runner) FetchDatasets(ctx context.Context, repos RepoLoadResult) DatasetFetchResult {
+func (r *Runner) RunDataPipelines(ctx context.Context, repos RepoLoadResult) []string {
 	collector := &fetchCollector{
 		writeOps: make([]dbWriteOp, 0, len(repos.ActiveRepos)*2+3),
 	}
@@ -105,21 +101,18 @@ func (r *Runner) FetchDatasets(ctx context.Context, repos RepoLoadResult) Datase
 	log.Printf("stage ingestion: fetching per-repo datasets (sbom)")
 	r.fetchSBOMDatasets(ctx, repos.ActiveRepos, collector)
 
-	return DatasetFetchResult{
-		WriteOps: collector.writeOps,
-		Errors:   collector.errors,
-	}
+	return r.executeWriteOps(ctx, collector.writeOps, collector.errors)
 }
 
 func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, repos RepoLoadResult, collector *fetchCollector) {
 	var orgWG sync.WaitGroup
 	orgFetch := []struct {
 		name string
-		run  func() error
+		run  func(context.Context) error
 	}{
 		{
 			name: "dependabot",
-			run: func() error {
+			run: func(ctx context.Context) error {
 				alerts, pages, err := r.client.FetchDependabotAlerts(ctx, r.cfg.Org, r.cfg.ResultsPerPage)
 				if err != nil {
 					return err
@@ -138,7 +131,7 @@ func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, repos RepoLoadResult
 		},
 		{
 			name: "code scanning",
-			run: func() error {
+			run: func(ctx context.Context) error {
 				alerts, pages, err := r.client.FetchCodeScanningAlerts(ctx, r.cfg.Org, r.cfg.ResultsPerPage)
 				if err != nil {
 					return err
@@ -157,7 +150,7 @@ func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, repos RepoLoadResult
 		},
 		{
 			name: "secret scanning",
-			run: func() error {
+			run: func(ctx context.Context) error {
 				alerts, pages, err := r.client.FetchSecretScanningAlerts(ctx, r.cfg.Org, r.cfg.ResultsPerPage)
 				if err != nil {
 					return err
@@ -178,18 +171,20 @@ func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, repos RepoLoadResult
 
 	for _, task := range orgFetch {
 		orgWG.Add(1)
-		go func(taskName string, run func() error) {
-			defer orgWG.Done()
-			started := time.Now()
-			log.Printf("%s fetch started", taskName)
-			if err := run(); err != nil {
-				collector.recordErr(fmt.Sprintf("%s ingestion failed", taskName), err)
-				return
-			}
-			log.Printf("%s fetch/build done in %s", taskName, time.Since(started))
-		}(task.name, task.run)
+		go r.runOrgFetchTask(ctx, &orgWG, task.name, task.run, collector)
 	}
 	orgWG.Wait()
+}
+
+func (r *Runner) runOrgFetchTask(ctx context.Context, wg *sync.WaitGroup, taskName string, run func(context.Context) error, collector *fetchCollector) {
+	defer wg.Done()
+	started := time.Now()
+	log.Printf("%s fetch started", taskName)
+	if err := run(ctx); err != nil {
+		collector.recordErr(fmt.Sprintf("%s ingestion failed", taskName), err)
+		return
+	}
+	log.Printf("%s fetch/build done in %s", taskName, time.Since(started))
 }
 
 func (r *Runner) fetchSBOMDatasets(ctx context.Context, activeRepos []*gogithub.Repository, collector *fetchCollector) {
@@ -232,10 +227,9 @@ func (r *Runner) fetchSBOMDatasets(ctx context.Context, activeRepos []*gogithub.
 	repoWG.Wait()
 }
 
-func (r *Runner) ExecuteWrites(ctx context.Context, fetchResult DatasetFetchResult) []string {
-	writeOps := append([]dbWriteOp(nil), fetchResult.WriteOps...)
-	errorsSeen := append([]string(nil), fetchResult.Errors...)
-
+func (r *Runner) executeWriteOps(ctx context.Context, writeOps []dbWriteOp, initialErrors []string) []string {
+	writeOps = append([]dbWriteOp(nil), writeOps...)
+	errorsSeen := append([]string(nil), initialErrors...)
 	log.Printf("stage writes: queued db operations=%d", len(writeOps))
 	sort.SliceStable(writeOps, func(i, j int) bool {
 		if writeOps[i].priority == writeOps[j].priority {
@@ -260,8 +254,12 @@ func (r *Runner) ExecuteWrites(ctx context.Context, fetchResult DatasetFetchResu
 }
 
 func (r *Runner) ExportReport(ctx context.Context) error {
-	if err := r.store.ExportCSVReport(ctx, r.cfg.CSVOutputPath); err != nil {
+	reportData, err := r.store.QueryReportData(ctx)
+	if err != nil {
 		return fmt.Errorf("failed to export csv report: %w", err)
+	}
+	if err := exporter.WriteCSV(r.cfg.CSVOutputPath, reportData.Headers, reportData.Records); err != nil {
+		return fmt.Errorf("failed to write csv report: %w", err)
 	}
 	return nil
 }

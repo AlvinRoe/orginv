@@ -37,8 +37,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fetchResult := runner.FetchDatasets(ctx, repos)
-	errorsSeen := runner.ExecuteWrites(ctx, fetchResult)
+	errorsSeen := runner.RunDataPipelines(ctx, repos)
 	if err := runner.ExportReport(ctx); err != nil {
 		log.Fatal(err)
 	}
