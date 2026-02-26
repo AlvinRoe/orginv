@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"log"
+	"time"
 
 	githubclient "github.com/AlvinRoe/orginv/internal/clients/github"
 	"github.com/AlvinRoe/orginv/internal/config"
@@ -19,7 +20,11 @@ func main() {
 	}
 
 	ctx := context.Background()
-	client := githubclient.New(ctx, cfg.Token)
+	client := githubclient.New(ctx, cfg.Token, githubclient.Options{
+		MaxRetries:      cfg.GitHubMaxRetries,
+		BaseDelay:       time.Duration(cfg.GitHubRetryBaseDelay) * time.Millisecond,
+		RepoPageWorkers: cfg.GitHubRepoPageWorkers,
+	})
 
 	db, err := sql.Open("sqlite", cfg.SQLitePath)
 	if err != nil {

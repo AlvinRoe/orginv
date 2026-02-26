@@ -17,7 +17,50 @@ func normalizeSBOMDownloadLocation(v string) string {
 	return v
 }
 
+type sbomPackageIdentity struct {
+	ecosystem        string
+	name             string
+	version          string
+	purl             string
+	licenseConcluded string
+	licenseDeclared  string
+	downloadLocation string
+	filesAnalyzed    interface{}
+}
+
+func sbomIdentityFromPackage(index int, pkg *github.RepoDependencies) sbomPackageIdentity {
+	if pkg == nil {
+		return sbomPackageIdentity{}
+	}
+	purl := extractPURLFromDependency(pkg)
+	ecosystem := ecosystemFromPURL(purl)
+	if ecosystem == "" {
+		ecosystem = "unknown"
+	}
+	packageName := strings.TrimSpace(pkg.GetName())
+	if packageName == "" {
+		packageName = firstNonEmpty(strings.TrimSpace(purl), strings.TrimSpace(pkg.GetSPDXID()), fmt.Sprintf("unnamed-package-%d", index+1))
+	}
+	return sbomPackageIdentity{
+		ecosystem:        ecosystem,
+		name:             packageName,
+		version:          pkg.GetVersionInfo(),
+		purl:             purl,
+		licenseConcluded: firstNonEmpty(pkg.GetLicenseConcluded(), pkg.GetLicenseDeclared()),
+		licenseDeclared:  pkg.GetLicenseDeclared(),
+		downloadLocation: normalizeSBOMDownloadLocation(pkg.GetDownloadLocation()),
+		filesAnalyzed:    boolPtrToIntPtr(pkg.FilesAnalyzed),
+	}
+}
+
 func (s *Store) IngestSBOM(ctx context.Context, repoID int64, sbom *github.SBOM) error {
+	if err := s.IngestSBOMMain(ctx, repoID, sbom); err != nil {
+		return err
+	}
+	return s.IngestSBOMLinks(ctx, repoID, sbom)
+}
+
+func (s *Store) IngestSBOMMain(ctx context.Context, repoID int64, sbom *github.SBOM) error {
 	if sbom == nil || sbom.SBOM == nil {
 		return nil
 	}
@@ -29,7 +72,177 @@ func (s *Store) IngestSBOM(ctx context.Context, repoID int64, sbom *github.SBOM)
 	}
 	defer tx.Rollback()
 
-	_, err = tx.ExecContext(ctx, `
+	if _, err := upsertSBOMDocumentTx(ctx, tx, repoID, doc); err != nil {
+		return err
+	}
+
+	for i, pkg := range doc.Packages {
+		if pkg == nil {
+			continue
+		}
+		identity := sbomIdentityFromPackage(i, pkg)
+		packageID, err := upsertPackageTx(
+			tx,
+			identity.ecosystem,
+			identity.name,
+			identity.version,
+			identity.purl,
+			identity.licenseConcluded,
+			"",
+			identity.licenseDeclared,
+			identity.downloadLocation,
+			identity.filesAnalyzed,
+		)
+		if err != nil {
+			return fmt.Errorf("sbom package upsert failed (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q): %w", repoID, pkg.GetSPDXID(), identity.ecosystem, identity.name, identity.version, identity.purl, err)
+		}
+		if packageID == 0 {
+			return fmt.Errorf("sbom package id is zero (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q)", repoID, pkg.GetSPDXID(), identity.ecosystem, identity.name, identity.version, identity.purl)
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (s *Store) IngestSBOMLinks(ctx context.Context, repoID int64, sbom *github.SBOM) error {
+	if sbom == nil || sbom.SBOM == nil {
+		return nil
+	}
+	doc := sbom.SBOM
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	sbomID, err := upsertSBOMDocumentTx(ctx, tx, repoID, doc)
+	if err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM sbom_packages WHERE sbom_id = ?;
+		DELETE FROM sbom_package_external_refs WHERE sbom_id = ?;
+		DELETE FROM sbom_relationships WHERE sbom_id = ?;
+	`, sbomID, sbomID, sbomID); err != nil {
+		return err
+	}
+
+	repoPackageStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO repo_packages(repo_id, package_id, source)
+		VALUES (?, ?, 'sbom')
+		ON CONFLICT(repo_id, package_id, source) DO NOTHING
+	`)
+	if err != nil {
+		return err
+	}
+	defer repoPackageStmt.Close()
+
+	sbomDocPackageStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO sbom_packages(
+			sbom_id, spdx_package_id, package_id, license_concluded, download_location
+		)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(sbom_id, spdx_package_id) DO UPDATE SET
+			package_id = excluded.package_id,
+			license_concluded = excluded.license_concluded,
+			download_location = excluded.download_location
+	`)
+	if err != nil {
+		return err
+	}
+	defer sbomDocPackageStmt.Close()
+
+	externalRefStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO sbom_package_external_refs(
+			sbom_id, package_id, reference_category, reference_type, reference_locator
+		) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT DO NOTHING
+	`)
+	if err != nil {
+		return err
+	}
+	defer externalRefStmt.Close()
+
+	relationshipStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO sbom_relationships(
+			sbom_id, from_package_id, to_package_id, relationship_type
+		)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT DO NOTHING
+	`)
+	if err != nil {
+		return err
+	}
+	defer relationshipStmt.Close()
+
+	packageBySPDX := make(map[string]int64, len(doc.Packages))
+	for i, pkg := range doc.Packages {
+		if pkg == nil {
+			continue
+		}
+		identity := sbomIdentityFromPackage(i, pkg)
+		packageID, err := resolvePackageIDTx(tx, identity.ecosystem, identity.name, identity.version, identity.purl)
+		if err != nil {
+			return fmt.Errorf("sbom package lookup failed (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q): %w", repoID, pkg.GetSPDXID(), identity.ecosystem, identity.name, identity.version, identity.purl, err)
+		}
+		if packageID == 0 {
+			return fmt.Errorf("sbom package not found for links (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q)", repoID, pkg.GetSPDXID(), identity.ecosystem, identity.name, identity.version, identity.purl)
+		}
+		if spdxID := strings.TrimSpace(pkg.GetSPDXID()); spdxID != "" {
+			packageBySPDX[spdxID] = packageID
+		}
+		if _, err := repoPackageStmt.ExecContext(ctx, repoID, packageID); err != nil {
+			return fmt.Errorf("sbom repo_packages insert failed (repo_id=%d package_id=%d): %w", repoID, packageID, err)
+		}
+
+		if _, err := sbomDocPackageStmt.ExecContext(
+			ctx,
+			sbomID,
+			pkg.GetSPDXID(),
+			packageID,
+			pkg.GetLicenseConcluded(),
+			identity.downloadLocation,
+		); err != nil {
+			return fmt.Errorf("sbom document package insert failed (repo_id=%d sbom_id=%d spdx=%q package_id=%d): %w", repoID, sbomID, pkg.GetSPDXID(), packageID, err)
+		}
+
+		for _, ref := range pkg.ExternalRefs {
+			if ref == nil {
+				continue
+			}
+			if _, err := externalRefStmt.ExecContext(ctx, sbomID, packageID, ref.ReferenceCategory, ref.ReferenceType, ref.ReferenceLocator); err != nil {
+				return fmt.Errorf("sbom external ref insert failed (repo_id=%d sbom_id=%d package_id=%d ref_type=%q locator=%q): %w", repoID, sbomID, packageID, ref.ReferenceType, ref.ReferenceLocator, err)
+			}
+		}
+	}
+
+	for _, rel := range doc.Relationships {
+		if rel == nil {
+			continue
+		}
+		fromID, okFrom := packageBySPDX[rel.SPDXElementID]
+		toID, okTo := packageBySPDX[rel.RelatedSPDXElement]
+		if !okFrom && !okTo {
+			continue
+		}
+		if _, err := relationshipStmt.ExecContext(
+			ctx,
+			sbomID,
+			nullableInt64(okFrom, fromID),
+			nullableInt64(okTo, toID),
+			rel.RelationshipType,
+		); err != nil {
+			return fmt.Errorf("sbom relationship insert failed (repo_id=%d sbom_id=%d from_spdx=%q to_spdx=%q from_package_id=%v to_package_id=%v): %w", repoID, sbomID, rel.SPDXElementID, rel.RelatedSPDXElement, nullableInt64(okFrom, fromID), nullableInt64(okTo, toID), err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+func upsertSBOMDocumentTx(ctx context.Context, tx *sql.Tx, repoID int64, doc *github.SBOMInfo) (int64, error) {
+	_, err := tx.ExecContext(ctx, `
 		INSERT INTO sbom(
 			repo_id, spdx_id, spdx_version, document_name, data_license,
 			document_namespace, generated_at, creation_creators, document_describes_count, package_count, relationship_count
@@ -60,153 +273,90 @@ func (s *Store) IngestSBOM(ctx context.Context, repoID int64, sbom *github.SBOM)
 		len(doc.Relationships),
 	)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	var sbomID int64
 	if err := tx.QueryRowContext(ctx, `SELECT sbom_id FROM sbom WHERE repo_id = ?`, repoID).Scan(&sbomID); err != nil {
-		return err
+		return 0, err
 	}
+	return sbomID, nil
+}
 
-	if _, err := tx.ExecContext(ctx, `
-			DELETE FROM sbom_packages WHERE sbom_id = ?;
-			DELETE FROM sbom_package_external_refs WHERE sbom_id = ?;
-			DELETE FROM sbom_relationships WHERE sbom_id = ?;
-		`, sbomID, sbomID, sbomID); err != nil {
-		return err
+func upsertPackageKeyTx(tx *sql.Tx, ecosystem, name string) (int64, error) {
+	ecosystem = safeStr(ecosystem)
+	name = safeStr(name)
+	if ecosystem == "" {
+		ecosystem = "unknown"
 	}
+	if name == "" {
+		return 0, nil
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO package_keys(ecosystem, name)
+		VALUES (?, ?)
+		ON CONFLICT(ecosystem, name) DO NOTHING
+	`, ecosystem, name); err != nil {
+		return 0, err
+	}
+	var packageKeyID int64
+	if err := tx.QueryRow(`
+		SELECT package_key_id FROM package_keys
+		WHERE ecosystem = ? AND name = ?
+	`, ecosystem, name).Scan(&packageKeyID); err != nil {
+		return 0, err
+	}
+	return packageKeyID, nil
+}
 
-	repoPackageStmt, err := tx.PrepareContext(ctx, `
-			INSERT INTO repo_packages(repo_id, package_id, source)
-			VALUES (?, ?, 'sbom')
-			ON CONFLICT(repo_id, package_id, source) DO NOTHING
-		`)
+func lookupPackageKeyIDTx(tx *sql.Tx, ecosystem, name string) (int64, error) {
+	ecosystem = safeStr(ecosystem)
+	name = safeStr(name)
+	if ecosystem == "" {
+		ecosystem = "unknown"
+	}
+	if name == "" {
+		return 0, nil
+	}
+	var packageKeyID int64
+	err := tx.QueryRow(`
+		SELECT package_key_id FROM package_keys
+		WHERE ecosystem = ? AND name = ?
+		LIMIT 1
+	`, ecosystem, name).Scan(&packageKeyID)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
 	if err != nil {
-		return err
+		return 0, err
 	}
-	defer repoPackageStmt.Close()
+	return packageKeyID, nil
+}
 
-	sbomDocPackageStmt, err := tx.PrepareContext(ctx, `
-			INSERT INTO sbom_packages(
-				sbom_id, spdx_package_id, package_id, license_concluded, download_location
-			)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(sbom_id, spdx_package_id) DO UPDATE SET
-			package_id = excluded.package_id,
-			license_concluded = excluded.license_concluded,
-			download_location = excluded.download_location
-	`)
+func resolvePackageIDTx(tx *sql.Tx, ecosystem, name, version, purl string) (int64, error) {
+	ecosystem = safeStr(ecosystem)
+	name = safeStr(name)
+	version = safeStr(version)
+	purl = safeStr(purl)
+	if ecosystem == "" {
+		ecosystem = "unknown"
+	}
+	if name == "" {
+		return 0, nil
+	}
+	var packageID int64
+	err := tx.QueryRow(`
+		SELECT package_id FROM packages
+		WHERE ecosystem = ? AND name = ? AND version = ? AND purl = ?
+		LIMIT 1
+	`, ecosystem, name, version, purl).Scan(&packageID)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
 	if err != nil {
-		return err
+		return 0, err
 	}
-	defer sbomDocPackageStmt.Close()
-
-	externalRefStmt, err := tx.PrepareContext(ctx, `
-			INSERT INTO sbom_package_external_refs(
-				sbom_id, package_id, reference_category, reference_type, reference_locator
-			) VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT DO NOTHING
-	`)
-	if err != nil {
-		return err
-	}
-	defer externalRefStmt.Close()
-
-	relationshipStmt, err := tx.PrepareContext(ctx, `
-			INSERT INTO sbom_relationships(
-				sbom_id, from_package_id, to_package_id, relationship_type
-			)
-		VALUES (?, ?, ?, ?)
-		ON CONFLICT DO NOTHING
-	`)
-	if err != nil {
-		return err
-	}
-	defer relationshipStmt.Close()
-
-	packageBySPDX := make(map[string]int64, len(doc.Packages))
-	for i, pkg := range doc.Packages {
-		if pkg == nil {
-			continue
-		}
-		purl := extractPURLFromDependency(pkg)
-		ecosystem := ecosystemFromPURL(purl)
-		if ecosystem == "" {
-			ecosystem = "unknown"
-		}
-		packageName := strings.TrimSpace(pkg.GetName())
-		if packageName == "" {
-			packageName = firstNonEmpty(strings.TrimSpace(purl), strings.TrimSpace(pkg.GetSPDXID()), fmt.Sprintf("unnamed-package-%d", i+1))
-		}
-		packageID, err := upsertPackageTx(
-			tx,
-			ecosystem,
-			packageName,
-			pkg.GetVersionInfo(),
-			purl,
-			firstNonEmpty(pkg.GetLicenseConcluded(), pkg.GetLicenseDeclared()),
-			"",
-			pkg.GetLicenseDeclared(),
-			normalizeSBOMDownloadLocation(pkg.GetDownloadLocation()),
-			boolPtrToIntPtr(pkg.FilesAnalyzed),
-		)
-		if err != nil {
-			return fmt.Errorf("sbom package upsert failed (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q): %w", repoID, pkg.GetSPDXID(), ecosystem, packageName, pkg.GetVersionInfo(), purl, err)
-		}
-		if packageID == 0 {
-			return fmt.Errorf("sbom package id is zero (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q)", repoID, pkg.GetSPDXID(), ecosystem, packageName, pkg.GetVersionInfo(), purl)
-		}
-		if spdxID := strings.TrimSpace(pkg.GetSPDXID()); spdxID != "" {
-			packageBySPDX[spdxID] = packageID
-		}
-		if _, err := repoPackageStmt.ExecContext(ctx, repoID, packageID); err != nil {
-			return fmt.Errorf("sbom repo_packages insert failed (repo_id=%d package_id=%d): %w", repoID, packageID, err)
-		}
-
-		if _, err := sbomDocPackageStmt.ExecContext(
-			ctx,
-			sbomID,
-			pkg.GetSPDXID(),
-			packageID,
-			pkg.GetLicenseConcluded(),
-			normalizeSBOMDownloadLocation(pkg.GetDownloadLocation()),
-		); err != nil {
-			return fmt.Errorf("sbom document package insert failed (repo_id=%d sbom_id=%d spdx=%q package_id=%d): %w", repoID, sbomID, pkg.GetSPDXID(), packageID, err)
-		}
-
-		for _, ref := range pkg.ExternalRefs {
-			if ref == nil {
-				continue
-			}
-			_, err := externalRefStmt.ExecContext(ctx, sbomID, packageID, ref.ReferenceCategory, ref.ReferenceType, ref.ReferenceLocator)
-			if err != nil {
-				return fmt.Errorf("sbom external ref insert failed (repo_id=%d sbom_id=%d package_id=%d ref_type=%q locator=%q): %w", repoID, sbomID, packageID, ref.ReferenceType, ref.ReferenceLocator, err)
-			}
-		}
-	}
-
-	for _, rel := range doc.Relationships {
-		if rel == nil {
-			continue
-		}
-		fromID, okFrom := packageBySPDX[rel.SPDXElementID]
-		toID, okTo := packageBySPDX[rel.RelatedSPDXElement]
-		if !okFrom && !okTo {
-			continue
-		}
-		_, err := relationshipStmt.ExecContext(
-			ctx,
-			sbomID,
-			nullableInt64(okFrom, fromID),
-			nullableInt64(okTo, toID),
-			rel.RelationshipType,
-		)
-		if err != nil {
-			return fmt.Errorf("sbom relationship insert failed (repo_id=%d sbom_id=%d from_spdx=%q to_spdx=%q from_package_id=%v to_package_id=%v): %w", repoID, sbomID, rel.SPDXElementID, rel.RelatedSPDXElement, nullableInt64(okFrom, fromID), nullableInt64(okTo, toID), err)
-		}
-	}
-
-	return tx.Commit()
+	return packageID, nil
 }
 
 func upsertPackageTx(tx *sql.Tx, ecosystem, name, version, purl, license, supplier, licenseDeclared, downloadLocation string, filesAnalyzed interface{}) (int64, error) {
@@ -220,15 +370,24 @@ func upsertPackageTx(tx *sql.Tx, ecosystem, name, version, purl, license, suppli
 	if name == "" {
 		return 0, nil
 	}
+	packageKeyID, err := upsertPackageKeyTx(tx, ecosystem, name)
+	if err != nil {
+		return 0, err
+	}
+	if packageKeyID == 0 {
+		return 0, nil
+	}
+
 	res, err := tx.Exec(`
-		INSERT INTO packages(ecosystem, name, version, purl, license, supplier, license_declared, download_location, files_analyzed)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO packages(package_key_id, ecosystem, name, version, purl, license, supplier, license_declared, download_location, files_analyzed)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(ecosystem, name, version, purl) DO NOTHING
-	`, ecosystem, name, version, purl, license, supplier, licenseDeclared, downloadLocation, filesAnalyzed)
+	`, packageKeyID, ecosystem, name, version, purl, license, supplier, licenseDeclared, downloadLocation, filesAnalyzed)
 	if err != nil {
 		return 0, err
 	}
 	_, _ = res.RowsAffected()
+
 	var packageID int64
 	if err := tx.QueryRow(`
 		SELECT package_id FROM packages
@@ -236,17 +395,17 @@ func upsertPackageTx(tx *sql.Tx, ecosystem, name, version, purl, license, suppli
 	`, ecosystem, name, version, purl).Scan(&packageID); err != nil {
 		return 0, err
 	}
-	_, err = tx.Exec(`
+	if _, err := tx.Exec(`
 		UPDATE packages
 		SET
+			package_key_id = ?,
 			license = COALESCE(NULLIF(?, ''), license),
 			supplier = COALESCE(NULLIF(?, ''), supplier),
 			license_declared = COALESCE(NULLIF(?, ''), license_declared),
 			download_location = COALESCE(NULLIF(?, ''), download_location),
 			files_analyzed = COALESCE(?, files_analyzed)
 		WHERE package_id = ?
-	`, license, supplier, licenseDeclared, downloadLocation, filesAnalyzed, packageID)
-	if err != nil {
+	`, packageKeyID, license, supplier, licenseDeclared, downloadLocation, filesAnalyzed, packageID); err != nil {
 		return 0, err
 	}
 	return packageID, nil

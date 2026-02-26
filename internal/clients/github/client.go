@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"strconv"
 	"sync"
 	"time"
 
@@ -19,6 +18,12 @@ type retryRoundTripper struct {
 	baseDelay  time.Duration
 }
 
+type Options struct {
+	MaxRetries      int
+	BaseDelay       time.Duration
+	RepoPageWorkers int
+}
+
 func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	var resp *http.Response
 	var err error
@@ -27,23 +32,27 @@ func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 		resp, err = r.transport.RoundTrip(req)
 		if err != nil {
 			if attempt < r.maxRetries {
-				time.Sleep(r.baseDelay * time.Duration(1<<attempt))
+				if sleepErr := sleepWithContext(req.Context(), r.baseDelay*time.Duration(1<<attempt)); sleepErr != nil {
+					return nil, sleepErr
+				}
 				continue
 			}
 			return nil, err
 		}
 
-		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+		if isRateLimitResponse(resp) {
+			// Let go-github return a rate-limit error immediately; do not wait/retry.
+			return resp, nil
+		}
+
+		if retryableStatus(resp) {
 			if attempt < r.maxRetries {
 				resp.Body.Close()
-				delay := r.baseDelay * time.Duration(1<<attempt)
-				if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
-					if seconds, parseErr := strconv.Atoi(retryAfter); parseErr == nil {
-						delay = time.Duration(seconds) * time.Second
-					}
+				delay := retryDelay(r.baseDelay, attempt)
+				log.Printf("Retrying request (attempt %d/%d) after %v: %s %s status=%d", attempt+1, r.maxRetries, delay, req.Method, req.URL, resp.StatusCode)
+				if sleepErr := sleepWithContext(req.Context(), delay); sleepErr != nil {
+					return nil, sleepErr
 				}
-				log.Printf("Retrying request (attempt %d/%d) after %v: %s %s", attempt+1, r.maxRetries, delay, req.Method, req.URL)
-				time.Sleep(delay)
 				continue
 			}
 		}
@@ -55,21 +64,35 @@ func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 }
 
 type Client struct {
-	raw *gogithub.Client
+	raw             *gogithub.Client
+	repoPageWorkers int
 }
 
-func New(ctx context.Context, token string) *Client {
+func New(ctx context.Context, token string, opts Options) *Client {
+	if opts.MaxRetries <= 0 {
+		opts.MaxRetries = 5
+	}
+	if opts.BaseDelay <= 0 {
+		opts.BaseDelay = 1 * time.Second
+	}
+	if opts.RepoPageWorkers <= 0 {
+		opts.RepoPageWorkers = 4
+	}
+
 	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
 	oauthClient := oauth2.NewClient(ctx, ts)
 	retryClient := &http.Client{
 		Transport: &retryRoundTripper{
 			transport:  oauthClient.Transport,
-			maxRetries: 3,
-			baseDelay:  1 * time.Second,
+			maxRetries: opts.MaxRetries,
+			baseDelay:  opts.BaseDelay,
 		},
 		Timeout: oauthClient.Timeout,
 	}
-	return &Client{raw: gogithub.NewClient(retryClient)}
+	return &Client{
+		raw:             gogithub.NewClient(retryClient),
+		repoPageWorkers: opts.RepoPageWorkers,
+	}
 }
 
 func (c *Client) FetchAllRepos(ctx context.Context, org string, perPage int) ([]*gogithub.Repository, error) {
@@ -89,18 +112,27 @@ func (c *Client) FetchAllRepos(ctx context.Context, org string, perPage int) ([]
 	}
 
 	var mu sync.Mutex
+	var errMu sync.Mutex
 	var wg sync.WaitGroup
+	var firstErr error
+	sem := make(chan struct{}, c.repoPageWorkers)
 	for page := 2; page <= resp.LastPage; page++ {
+		sem <- struct{}{}
 		wg.Add(1)
 		go func(pageNum int) {
 			defer wg.Done()
+			defer func() { <-sem }()
 			pageOpt := &gogithub.RepositoryListByOrgOptions{
 				Type:        "all",
 				ListOptions: gogithub.ListOptions{PerPage: perPage, Page: pageNum},
 			}
 			repos, _, pErr := c.raw.Repositories.ListByOrg(ctx, org, pageOpt)
 			if pErr != nil {
-				log.Printf("failed to list repos page %d: %v", pageNum, pErr)
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("list repos page %d failed: %w", pageNum, pErr)
+				}
+				errMu.Unlock()
 				return
 			}
 			mu.Lock()
@@ -109,6 +141,9 @@ func (c *Client) FetchAllRepos(ctx context.Context, org string, perPage int) ([]
 		}(page)
 	}
 	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
 	return allRepos, nil
 }
 
@@ -290,4 +325,43 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+func retryableStatus(resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
+	return resp.StatusCode >= 500
+}
+
+func isRateLimitResponse(resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return true
+	}
+	if resp.StatusCode != http.StatusForbidden {
+		return false
+	}
+	if resp.Header.Get("Retry-After") != "" {
+		return true
+	}
+	return resp.Header.Get("X-RateLimit-Remaining") == "0"
+}
+
+func retryDelay(baseDelay time.Duration, attempt int) time.Duration {
+	delay := baseDelay * time.Duration(1<<attempt)
+	return delay
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

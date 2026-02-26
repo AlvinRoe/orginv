@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -13,8 +14,6 @@ import (
 	"github.com/AlvinRoe/orginv/internal/store/sqlite"
 	gogithub "github.com/google/go-github/v82/github"
 )
-
-const repoWorkers = 10
 
 type Runner struct {
 	cfg    config.Config
@@ -28,15 +27,15 @@ type RepoLoadResult struct {
 }
 
 type dbWriteOp struct {
-	name     string
-	priority int
-	rows     int
-	apply    func(context.Context) error
+	name  string
+	rows  int
+	apply func(context.Context) error
 }
 
 type fetchCollector struct {
-	writeOpsMu sync.Mutex
-	writeOps   []dbWriteOp
+	writeOpsMu   sync.Mutex
+	mainWriteOps []dbWriteOp
+	linkWriteOps []dbWriteOp
 
 	errorsMu sync.Mutex
 	errors   []string
@@ -53,8 +52,10 @@ type RepoFetcher interface {
 type Store interface {
 	InitSchema(ctx context.Context) error
 	UpsertRepos(ctx context.Context, org string, repos []*gogithub.Repository) (sqlite.RepoIndex, []*gogithub.Repository, error)
-	IngestSBOM(ctx context.Context, repoID int64, sbom *gogithub.SBOM) error
-	IngestDependabotAlerts(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.DependabotAlert) error
+	IngestSBOMMain(ctx context.Context, repoID int64, sbom *gogithub.SBOM) error
+	IngestSBOMLinks(ctx context.Context, repoID int64, sbom *gogithub.SBOM) error
+	IngestDependabotAlertsMain(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.DependabotAlert) error
+	IngestDependabotAlertsLinks(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.DependabotAlert) error
 	IngestCodeScanningAlerts(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.Alert) error
 	IngestSecretScanningAlerts(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.SecretScanningAlert) error
 	QueryReportData(ctx context.Context) (sqlite.ReportData, error)
@@ -92,7 +93,8 @@ func (r *Runner) LoadRepos(ctx context.Context) (RepoLoadResult, error) {
 
 func (r *Runner) RunDataPipelines(ctx context.Context, repos RepoLoadResult) []string {
 	collector := &fetchCollector{
-		writeOps: make([]dbWriteOp, 0, len(repos.ActiveRepos)*2+3),
+		mainWriteOps: make([]dbWriteOp, 0, len(repos.ActiveRepos)*2+3),
+		linkWriteOps: make([]dbWriteOp, 0, len(repos.ActiveRepos)*2+3),
 	}
 
 	log.Printf("stage ingestion: fetching org-level alert datasets")
@@ -101,7 +103,8 @@ func (r *Runner) RunDataPipelines(ctx context.Context, repos RepoLoadResult) []s
 	log.Printf("stage ingestion: fetching per-repo datasets (sbom)")
 	r.fetchSBOMDatasets(ctx, repos.ActiveRepos, collector)
 
-	return r.executeWriteOps(ctx, collector.writeOps, collector.errors)
+	mainErrors := r.executeWriteOps(ctx, "main", collector.mainWriteOps, collector.errors)
+	return r.executeWriteOps(ctx, "link", collector.linkWriteOps, mainErrors)
 }
 
 func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, repos RepoLoadResult, collector *fetchCollector) {
@@ -118,12 +121,18 @@ func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, repos RepoLoadResult
 					return err
 				}
 				log.Printf("dependabot fetch complete: pages=%d alerts=%d", pages, len(alerts))
-				collector.enqueueWriteOp(dbWriteOp{
-					name:     "dependabot alerts",
-					priority: 30,
-					rows:     len(alerts),
+				collector.enqueueMainWriteOp(dbWriteOp{
+					name: "dependabot alerts",
+					rows: len(alerts),
 					apply: func(ctx context.Context) error {
-						return r.store.IngestDependabotAlerts(ctx, repos.RepoIDByName, alerts)
+						return r.store.IngestDependabotAlertsMain(ctx, repos.RepoIDByName, alerts)
+					},
+				})
+				collector.enqueueLinkWriteOp(dbWriteOp{
+					name: "dependabot advisory links",
+					rows: len(alerts),
+					apply: func(ctx context.Context) error {
+						return r.store.IngestDependabotAlertsLinks(ctx, repos.RepoIDByName, alerts)
 					},
 				})
 				return nil
@@ -137,10 +146,9 @@ func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, repos RepoLoadResult
 					return err
 				}
 				log.Printf("code scanning fetch complete: pages=%d alerts=%d", pages, len(alerts))
-				collector.enqueueWriteOp(dbWriteOp{
-					name:     "code scanning alerts",
-					priority: 30,
-					rows:     len(alerts),
+				collector.enqueueMainWriteOp(dbWriteOp{
+					name: "code scanning alerts",
+					rows: len(alerts),
 					apply: func(ctx context.Context) error {
 						return r.store.IngestCodeScanningAlerts(ctx, repos.RepoIDByName, alerts)
 					},
@@ -156,10 +164,9 @@ func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, repos RepoLoadResult
 					return err
 				}
 				log.Printf("secret scanning fetch complete: pages=%d alerts=%d", pages, len(alerts))
-				collector.enqueueWriteOp(dbWriteOp{
-					name:     "secret scanning alerts",
-					priority: 30,
-					rows:     len(alerts),
+				collector.enqueueMainWriteOp(dbWriteOp{
+					name: "secret scanning alerts",
+					rows: len(alerts),
 					apply: func(ctx context.Context) error {
 						return r.store.IngestSecretScanningAlerts(ctx, repos.RepoIDByName, alerts)
 					},
@@ -181,6 +188,9 @@ func (r *Runner) runOrgFetchTask(ctx context.Context, wg *sync.WaitGroup, taskNa
 	started := time.Now()
 	log.Printf("%s fetch started", taskName)
 	if err := run(ctx); err != nil {
+		if isRateLimitErr(err) {
+			log.Fatalf("fatal: GitHub rate limit encountered during %s fetch: %v", taskName, err)
+		}
 		collector.recordErr(fmt.Sprintf("%s ingestion failed", taskName), err)
 		return
 	}
@@ -191,7 +201,7 @@ func (r *Runner) fetchSBOMDatasets(ctx context.Context, activeRepos []*gogithub.
 	repoChan := make(chan *gogithub.Repository, len(activeRepos))
 	var repoWG sync.WaitGroup
 
-	for i := 0; i < repoWorkers; i++ {
+	for i := 0; i < r.cfg.SBOMWorkers; i++ {
 		repoWG.Add(1)
 		go func(workerID int) {
 			defer repoWG.Done()
@@ -203,14 +213,23 @@ func (r *Runner) fetchSBOMDatasets(ctx context.Context, activeRepos []*gogithub.
 
 				sbom, sbomErr := r.client.FetchSBOM(ctx, r.cfg.Org, repoName)
 				if sbomErr != nil {
+					if isRateLimitErr(sbomErr) {
+						log.Fatalf("fatal: GitHub rate limit encountered during sbom fetch (repo=%s): %v", repoName, sbomErr)
+					}
 					collector.recordErr(fmt.Sprintf("worker %d sbom %s", workerID, repoName), sbomErr)
 				} else {
-					collector.enqueueWriteOp(dbWriteOp{
-						name:     fmt.Sprintf("sbom %s", repoName),
-						priority: 10,
-						rows:     1,
+					collector.enqueueMainWriteOp(dbWriteOp{
+						name: fmt.Sprintf("sbom main %s", repoName),
+						rows: 1,
 						apply: func(ctx context.Context) error {
-							return r.store.IngestSBOM(ctx, repoID, sbom)
+							return r.store.IngestSBOMMain(ctx, repoID, sbom)
+						},
+					})
+					collector.enqueueLinkWriteOp(dbWriteOp{
+						name: fmt.Sprintf("sbom links %s", repoName),
+						rows: 1,
+						apply: func(ctx context.Context) error {
+							return r.store.IngestSBOMLinks(ctx, repoID, sbom)
 						},
 					})
 				}
@@ -227,15 +246,12 @@ func (r *Runner) fetchSBOMDatasets(ctx context.Context, activeRepos []*gogithub.
 	repoWG.Wait()
 }
 
-func (r *Runner) executeWriteOps(ctx context.Context, writeOps []dbWriteOp, initialErrors []string) []string {
+func (r *Runner) executeWriteOps(ctx context.Context, phase string, writeOps []dbWriteOp, initialErrors []string) []string {
 	writeOps = append([]dbWriteOp(nil), writeOps...)
 	errorsSeen := append([]string(nil), initialErrors...)
-	log.Printf("stage writes: queued db operations=%d", len(writeOps))
+	log.Printf("stage writes (%s): queued db operations=%d", phase, len(writeOps))
 	sort.SliceStable(writeOps, func(i, j int) bool {
-		if writeOps[i].priority == writeOps[j].priority {
-			return writeOps[i].name < writeOps[j].name
-		}
-		return writeOps[i].priority < writeOps[j].priority
+		return writeOps[i].name < writeOps[j].name
 	})
 
 	for idx, op := range writeOps {
@@ -280,8 +296,23 @@ func (c *fetchCollector) recordErr(msg string, err error) {
 	log.Printf("%s: %v", msg, err)
 }
 
-func (c *fetchCollector) enqueueWriteOp(op dbWriteOp) {
+func (c *fetchCollector) enqueueMainWriteOp(op dbWriteOp) {
 	c.writeOpsMu.Lock()
-	c.writeOps = append(c.writeOps, op)
+	c.mainWriteOps = append(c.mainWriteOps, op)
 	c.writeOpsMu.Unlock()
+}
+
+func (c *fetchCollector) enqueueLinkWriteOp(op dbWriteOp) {
+	c.writeOpsMu.Lock()
+	c.linkWriteOps = append(c.linkWriteOps, op)
+	c.writeOpsMu.Unlock()
+}
+
+func isRateLimitErr(err error) bool {
+	var rl *gogithub.RateLimitError
+	if errors.As(err, &rl) {
+		return true
+	}
+	var abuse *gogithub.AbuseRateLimitError
+	return errors.As(err, &abuse)
 }

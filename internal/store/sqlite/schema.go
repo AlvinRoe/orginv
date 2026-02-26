@@ -80,8 +80,15 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			FOREIGN KEY(repo_id) REFERENCES repos(repo_id),
 			FOREIGN KEY(scanner_id) REFERENCES scanners(scanner_id)
 		);`,
+		`CREATE TABLE IF NOT EXISTS package_keys (
+			package_key_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			ecosystem TEXT NOT NULL DEFAULT '',
+			name TEXT NOT NULL DEFAULT '',
+			UNIQUE (ecosystem, name)
+		);`,
 		`CREATE TABLE IF NOT EXISTS packages (
 			package_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			package_key_id INTEGER NOT NULL,
 			ecosystem TEXT NOT NULL DEFAULT '',
 			name TEXT NOT NULL DEFAULT '',
 			version TEXT NOT NULL DEFAULT '',
@@ -91,13 +98,15 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			license_declared TEXT,
 			download_location TEXT,
 			files_analyzed INTEGER,
-			UNIQUE (ecosystem, name, version, purl)
+			UNIQUE (ecosystem, name, version, purl),
+			FOREIGN KEY(package_key_id) REFERENCES package_keys(package_key_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS repo_packages (
 			repo_id INTEGER NOT NULL,
 			package_id INTEGER NOT NULL,
 			source TEXT NOT NULL,
 			PRIMARY KEY (repo_id, package_id, source),
+			FOREIGN KEY(repo_id) REFERENCES repos(repo_id),
 			FOREIGN KEY(package_id) REFERENCES packages(package_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS sbom (
@@ -112,7 +121,8 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			creation_creators TEXT,
 			document_describes_count INTEGER,
 			package_count INTEGER,
-			relationship_count INTEGER
+			relationship_count INTEGER,
+			FOREIGN KEY(repo_id) REFERENCES repos(repo_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS sbom_packages (
 			sbom_id INTEGER NOT NULL,
@@ -149,7 +159,7 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			alert_number INTEGER NOT NULL,
 			state TEXT,
 			severity TEXT,
-			package_id INTEGER,
+			package_key_id INTEGER,
 			manifest_path TEXT,
 			created_at TEXT,
 			updated_at TEXT,
@@ -161,7 +171,9 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			dismissed_comment TEXT,
 			auto_dismissed_at TEXT,
 			dependency_scope TEXT,
-			PRIMARY KEY (repo_id, alert_number)
+			PRIMARY KEY (repo_id, alert_number),
+			FOREIGN KEY(repo_id) REFERENCES repos(repo_id),
+			FOREIGN KEY(package_key_id) REFERENCES package_keys(package_key_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS advisories (
 			advisory_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -183,7 +195,9 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			repo_id INTEGER NOT NULL,
 			alert_number INTEGER NOT NULL,
 			advisory_id INTEGER NOT NULL,
-			PRIMARY KEY (repo_id, alert_number)
+			PRIMARY KEY (repo_id, alert_number),
+			FOREIGN KEY(repo_id, alert_number) REFERENCES dependabot_alerts(repo_id, alert_number),
+			FOREIGN KEY(advisory_id) REFERENCES advisories(advisory_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS advisory_vulnerabilities (
 			advisory_id INTEGER NOT NULL,
@@ -192,7 +206,9 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			severity TEXT,
 			vulnerable_version_range TEXT,
 			first_patched_version TEXT,
-			PRIMARY KEY (advisory_id, package_key_id, package_ordinal)
+			PRIMARY KEY (advisory_id, package_key_id, package_ordinal),
+			FOREIGN KEY(advisory_id) REFERENCES advisories(advisory_id),
+			FOREIGN KEY(package_key_id) REFERENCES package_keys(package_key_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS advisory_references (
 			reference_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -202,7 +218,9 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			advisory_id INTEGER NOT NULL,
 			reference_id INTEGER NOT NULL,
 			ref_num INTEGER NOT NULL,
-			PRIMARY KEY (advisory_id, reference_id)
+			PRIMARY KEY (advisory_id, reference_id),
+			FOREIGN KEY(advisory_id) REFERENCES advisories(advisory_id),
+			FOREIGN KEY(reference_id) REFERENCES advisory_references(reference_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS cwes (
 			cwe_id TEXT PRIMARY KEY,
@@ -211,7 +229,9 @@ func (s *Store) InitSchema(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS advisory_cwes (
 			advisory_id INTEGER NOT NULL,
 			cwe_id TEXT NOT NULL,
-			PRIMARY KEY (advisory_id, cwe_id)
+			PRIMARY KEY (advisory_id, cwe_id),
+			FOREIGN KEY(advisory_id) REFERENCES advisories(advisory_id),
+			FOREIGN KEY(cwe_id) REFERENCES cwes(cwe_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS code_scanning_alerts (
 			repo_id INTEGER NOT NULL,
@@ -239,7 +259,8 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			category TEXT,
 			classifications TEXT,
 			analysis_key TEXT,
-			PRIMARY KEY (repo_id, alert_number)
+			PRIMARY KEY (repo_id, alert_number),
+			FOREIGN KEY(repo_id) REFERENCES repos(repo_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS secret_alerts (
 			repo_id INTEGER NOT NULL,
@@ -275,7 +296,8 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			commit_sha TEXT,
 			commit_url TEXT,
 			pull_request_comment_url TEXT,
-			PRIMARY KEY (repo_id, alert_number)
+			PRIMARY KEY (repo_id, alert_number),
+			FOREIGN KEY(repo_id) REFERENCES repos(repo_id)
 		);`,
 	}
 
@@ -320,6 +342,7 @@ func applySchemaMigrations(ctx context.Context, db *sql.DB) error {
 		"repo_package_versions",
 		"package_versions",
 		"packages",
+		"package_keys",
 		"repo_scanners",
 		"scanners",
 		"repo_sast_scanners",

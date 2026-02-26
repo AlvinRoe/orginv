@@ -11,6 +11,13 @@ import (
 )
 
 func (s *Store) IngestDependabotAlerts(ctx context.Context, repoIDByName RepoIndex, alerts []*github.DependabotAlert) error {
+	if err := s.IngestDependabotAlertsMain(ctx, repoIDByName, alerts); err != nil {
+		return err
+	}
+	return s.IngestDependabotAlertsLinks(ctx, repoIDByName, alerts)
+}
+
+func (s *Store) IngestDependabotAlertsMain(ctx context.Context, repoIDByName RepoIndex, alerts []*github.DependabotAlert) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -19,14 +26,14 @@ func (s *Store) IngestDependabotAlerts(ctx context.Context, repoIDByName RepoInd
 
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO dependabot_alerts(
-			repo_id, alert_number, state, severity, package_id, manifest_path, created_at,
+			repo_id, alert_number, state, severity, package_key_id, manifest_path, created_at,
 			updated_at, fixed_at, dismissed_reason, url, html_url, dismissed_at, dismissed_comment,
 			auto_dismissed_at, dependency_scope
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(repo_id, alert_number) DO UPDATE SET
 			state = excluded.state,
 			severity = excluded.severity,
-			package_id = excluded.package_id,
+			package_key_id = excluded.package_key_id,
 			manifest_path = excluded.manifest_path,
 			created_at = excluded.created_at,
 			updated_at = excluded.updated_at,
@@ -65,7 +72,7 @@ func (s *Store) IngestDependabotAlerts(ctx context.Context, repoIDByName RepoInd
 		pkgName := firstNonEmpty(depPackage.GetName(), secPackage.GetName())
 		severity := strings.ToLower(firstNonEmpty(securityVuln.GetSeverity(), securityAdv.GetSeverity()))
 
-		packageID, depErr := upsertPackageTx(tx, ecosystem, pkgName, "", "", "", "", "", "", nil)
+		packageKeyID, depErr := upsertPackageKeyTx(tx, ecosystem, pkgName)
 		if depErr != nil {
 			return depErr
 		}
@@ -76,7 +83,7 @@ func (s *Store) IngestDependabotAlerts(ctx context.Context, repoIDByName RepoInd
 			a.GetNumber(),
 			a.GetState(),
 			severity,
-			nullableInt64Value(packageID),
+			nullableInt64Value(packageKeyID),
 			dependency.GetManifestPath(),
 			formatGitHubTimePtr(a.CreatedAt),
 			formatGitHubTimePtr(a.UpdatedAt),
@@ -92,12 +99,60 @@ func (s *Store) IngestDependabotAlerts(ctx context.Context, repoIDByName RepoInd
 		if err != nil {
 			return err
 		}
-		if err := upsertDependabotAdvisoryTx(tx, repoID, a); err != nil {
+		if err := upsertDependabotAdvisoryMainTx(tx, a); err != nil {
 			return err
 		}
 		inserted++
 	}
 	log.Printf("dependabot ingest summary: total=%d inserted=%d skipped_repo=%d", len(alerts), inserted, skippedRepo)
+
+	return tx.Commit()
+}
+
+func (s *Store) IngestDependabotAlertsLinks(ctx context.Context, repoIDByName RepoIndex, alerts []*github.DependabotAlert) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	linkStmt, err := tx.Prepare(`
+		INSERT INTO dependabot_alert_advisories(repo_id, alert_number, advisory_id)
+		VALUES (?, ?, ?)
+		ON CONFLICT(repo_id, alert_number) DO UPDATE SET advisory_id = excluded.advisory_id
+	`)
+	if err != nil {
+		return err
+	}
+	defer linkStmt.Close()
+
+	rebuiltAdvisories := make(map[int64]struct{})
+	for _, a := range alerts {
+		if a == nil {
+			continue
+		}
+		repoID, ok := resolveAlertRepoID(repoIDByName, a.GetRepository())
+		if !ok {
+			continue
+		}
+		advisoryID, err := findSecurityAdvisoryIDTx(tx, a.GetSecurityAdvisory())
+		if err != nil {
+			return err
+		}
+		if advisoryID == 0 {
+			continue
+		}
+		if _, err := linkStmt.Exec(repoID, a.GetNumber(), advisoryID); err != nil {
+			return err
+		}
+		if _, done := rebuiltAdvisories[advisoryID]; done {
+			continue
+		}
+		if err := rebuildDependabotAdvisoryLinksTx(tx, advisoryID, a.GetSecurityAdvisory()); err != nil {
+			return err
+		}
+		rebuiltAdvisories[advisoryID] = struct{}{}
+	}
 
 	return tx.Commit()
 }
@@ -331,11 +386,10 @@ func (s *Store) IngestSecretScanningAlerts(ctx context.Context, repoIDByName Rep
 	return tx.Commit()
 }
 
-func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAlert) error {
+func upsertDependabotAdvisoryMainTx(tx *sql.Tx, a *github.DependabotAlert) error {
 	if a == nil {
 		return nil
 	}
-	alertNumber := a.GetNumber()
 	adv := a.GetSecurityAdvisory()
 	advisoryID, err := upsertSecurityAdvisoryTx(tx, adv)
 	if err != nil {
@@ -344,14 +398,46 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAl
 	if adv == nil || advisoryID == 0 {
 		return nil
 	}
-	if advisoryID != 0 {
-		if _, err := tx.Exec(`
-			INSERT INTO dependabot_alert_advisories(repo_id, alert_number, advisory_id)
-			VALUES (?, ?, ?)
-			ON CONFLICT(repo_id, alert_number) DO UPDATE SET advisory_id = excluded.advisory_id
-		`, repoID, alertNumber, advisoryID); err != nil {
+
+	// Ensure base rows for link-stage FK targets exist.
+	for _, v := range adv.Vulnerabilities {
+		if v == nil {
+			continue
+		}
+		pkg := v.GetPackage()
+		if _, err := upsertPackageKeyTx(tx, pkg.GetEcosystem(), pkg.GetName()); err != nil {
 			return err
 		}
+	}
+
+	for _, ref := range adv.References {
+		if ref == nil {
+			continue
+		}
+		if _, err := upsertAdvisoryReferenceTx(tx, ref.GetURL()); err != nil {
+			return err
+		}
+	}
+
+	for _, cwe := range adv.CWEs {
+		if cwe == nil {
+			continue
+		}
+		cweID := strings.TrimSpace(cwe.GetCWEID())
+		if cweID == "" {
+			continue
+		}
+		if err := upsertCWETx(tx, cweID, cwe.GetName()); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func rebuildDependabotAdvisoryLinksTx(tx *sql.Tx, advisoryID int64, adv *github.DependabotSecurityAdvisory) error {
+	if adv == nil || advisoryID == 0 {
+		return nil
 	}
 
 	if _, err := tx.Exec(`
@@ -399,13 +485,12 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAl
 			continue
 		}
 		pkg := v.GetPackage()
-		packageID, err := upsertPackageTx(tx, pkg.GetEcosystem(), pkg.GetName(), "", "", "", "", "", "", nil)
+		packageKeyID, err := lookupPackageKeyIDTx(tx, pkg.GetEcosystem(), pkg.GetName())
 		if err != nil {
 			return err
 		}
-		packageKeyID := int64(-1)
-		if packageID != 0 {
-			packageKeyID = packageID
+		if packageKeyID == 0 {
+			return fmt.Errorf("advisory package key not found for ecosystem=%q name=%q advisory_id=%d", pkg.GetEcosystem(), pkg.GetName(), advisoryID)
 		}
 		packageOrdinals[packageKeyID]++
 		packageOrdinal := packageOrdinals[packageKeyID]
@@ -420,9 +505,12 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAl
 		if ref == nil {
 			continue
 		}
-		referenceID, err := upsertAdvisoryReferenceTx(tx, ref.GetURL())
+		referenceID, err := lookupAdvisoryReferenceIDTx(tx, ref.GetURL())
 		if err != nil {
 			return err
+		}
+		if referenceID == 0 {
+			return fmt.Errorf("advisory reference not found for advisory_id=%d url=%q", advisoryID, ref.GetURL())
 		}
 		_, err = advRefStmt.Exec(advisoryID, referenceID, i+1)
 		if err != nil {
@@ -438,9 +526,6 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAl
 		if cweID == "" {
 			continue
 		}
-		if err := upsertCWETx(tx, cweID, cwe.GetName()); err != nil {
-			return err
-		}
 		_, err := advCWEStmt.Exec(advisoryID, cweID)
 		if err != nil {
 			return err
@@ -448,6 +533,31 @@ func upsertDependabotAdvisoryTx(tx *sql.Tx, repoID int64, a *github.DependabotAl
 	}
 
 	return nil
+}
+
+func findSecurityAdvisoryIDTx(tx *sql.Tx, adv *github.DependabotSecurityAdvisory) (int64, error) {
+	if adv == nil {
+		return 0, nil
+	}
+	ghsaID := strings.TrimSpace(adv.GetGHSAID())
+	cveID := strings.TrimSpace(adv.GetCVEID())
+	if ghsaID == "" && cveID == "" {
+		return 0, nil
+	}
+	var advisoryID int64
+	err := tx.QueryRow(`
+		SELECT advisory_id
+		FROM advisories
+		WHERE ghsa_id = ? AND cve_id = ?
+		LIMIT 1
+	`, ghsaID, cveID).Scan(&advisoryID)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return advisoryID, nil
 }
 
 func upsertSecurityAdvisoryTx(tx *sql.Tx, adv *github.DependabotSecurityAdvisory) (int64, error) {
@@ -483,8 +593,9 @@ func upsertSecurityAdvisoryTx(tx *sql.Tx, adv *github.DependabotSecurityAdvisory
 	description := ""
 	severity := ""
 	if adv != nil {
+		severity = adv.GetSeverity()
 		if adv.CVSS != nil {
-			cvssScore = floatPtrToValue(adv.CVSS.Score)
+			cvssScore = normalizeCVSSScore(adv.CVSS.Score, severity)
 			cvssVector = adv.CVSS.GetVectorString()
 		}
 		epssPercentage = epssPercentageValue(adv.EPSS)
@@ -494,7 +605,6 @@ func upsertSecurityAdvisoryTx(tx *sql.Tx, adv *github.DependabotSecurityAdvisory
 		withdrawnAt = formatGitHubTimePtr(adv.WithdrawnAt)
 		summary = adv.GetSummary()
 		description = adv.GetDescription()
-		severity = adv.GetSeverity()
 	}
 
 	if existingID != 0 {
@@ -528,6 +638,18 @@ func upsertSecurityAdvisoryTx(tx *sql.Tx, adv *github.DependabotSecurityAdvisory
 	return res.LastInsertId()
 }
 
+func normalizeCVSSScore(score *float64, severity string) interface{} {
+	if score == nil {
+		return nil
+	}
+	// GitHub advisories can carry severity while score is effectively missing (0.0).
+	// Preserve 0.0 only when severity is explicitly "none".
+	if *score == 0 && !strings.EqualFold(strings.TrimSpace(severity), "none") {
+		return nil
+	}
+	return *score
+}
+
 func upsertAdvisoryReferenceTx(tx *sql.Tx, url string) (int64, error) {
 	url = strings.TrimSpace(url)
 	if url == "" {
@@ -549,6 +671,22 @@ func upsertAdvisoryReferenceTx(tx *sql.Tx, url string) (int64, error) {
 		return id, nil
 	}
 	if err := tx.QueryRow(`SELECT reference_id FROM advisory_references WHERE url = ?`, url).Scan(&id); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+func lookupAdvisoryReferenceIDTx(tx *sql.Tx, url string) (int64, error) {
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return 0, nil
+	}
+	var id int64
+	err := tx.QueryRow(`SELECT reference_id FROM advisory_references WHERE url = ? LIMIT 1`, url).Scan(&id)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
 		return 0, err
 	}
 	return id, nil

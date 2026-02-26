@@ -62,18 +62,18 @@ SELECT
 			'alert_number=' || da.alert_number ||
 			';state=' || COALESCE(da.state, '') ||
 			';severity=' || COALESCE(da.severity, '') ||
-			';ecosystem=' || COALESCE(p.ecosystem, '') ||
-			';package_name=' || COALESCE(p.name, '') ||
+			';ecosystem=' || COALESCE(pk.ecosystem, '') ||
+			';package_name=' || COALESCE(pk.name, '') ||
 			';manifest_path=' || COALESCE(da.manifest_path, '') ||
 			';created_at=' || COALESCE(da.created_at, '') ||
 			';updated_at=' || COALESCE(da.updated_at, '') ||
 			';fixed_at=' || COALESCE(da.fixed_at, '') ||
 			';dismissed_reason=' || COALESCE(da.dismissed_reason, '') ||
-			';package_id=' || COALESCE(CAST(da.package_id AS TEXT), ''),
+			';package_key_id=' || COALESCE(CAST(da.package_key_id AS TEXT), ''),
 			char(10)
 		), '')
 		FROM dependabot_alerts da
-		LEFT JOIN packages p ON p.package_id = da.package_id
+		LEFT JOIN package_keys pk ON pk.package_key_id = da.package_key_id
 		WHERE da.repo_id = r.repo_id
 	) AS dependabot_alert_details,
 	(SELECT COUNT(1) FROM code_scanning_alerts ca WHERE ca.repo_id = r.repo_id AND lower(ca.state) = 'open') AS open_code_scanning_alerts,
