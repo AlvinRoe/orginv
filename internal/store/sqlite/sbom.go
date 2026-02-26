@@ -81,7 +81,7 @@ func (s *Store) IngestSBOMMain(ctx context.Context, repoID int64, sbom *github.S
 			continue
 		}
 		identity := sbomIdentityFromPackage(i, pkg)
-		packageID, err := upsertPackageTx(
+		packageVersionID, err := upsertPackageTx(
 			tx,
 			identity.ecosystem,
 			identity.name,
@@ -96,8 +96,8 @@ func (s *Store) IngestSBOMMain(ctx context.Context, repoID int64, sbom *github.S
 		if err != nil {
 			return fmt.Errorf("sbom package upsert failed (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q): %w", repoID, pkg.GetSPDXID(), identity.ecosystem, identity.name, identity.version, identity.purl, err)
 		}
-		if packageID == 0 {
-			return fmt.Errorf("sbom package id is zero (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q)", repoID, pkg.GetSPDXID(), identity.ecosystem, identity.name, identity.version, identity.purl)
+		if packageVersionID == 0 {
+			return fmt.Errorf("sbom package version id is zero (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q)", repoID, pkg.GetSPDXID(), identity.ecosystem, identity.name, identity.version, identity.purl)
 		}
 	}
 
@@ -129,23 +129,23 @@ func (s *Store) IngestSBOMLinks(ctx context.Context, repoID int64, sbom *github.
 		return err
 	}
 
-	repoPackageStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO repo_packages(repo_id, package_id, source)
+	repoPackageVersionStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO repo_package_versions(repo_id, package_version_id, source)
 		VALUES (?, ?, 'sbom')
-		ON CONFLICT(repo_id, package_id, source) DO NOTHING
+		ON CONFLICT(repo_id, package_version_id, source) DO NOTHING
 	`)
 	if err != nil {
 		return err
 	}
-	defer repoPackageStmt.Close()
+	defer repoPackageVersionStmt.Close()
 
 	sbomDocPackageStmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO sbom_packages(
-			sbom_id, spdx_package_id, package_id, license_concluded, download_location
+			sbom_id, spdx_package_id, package_version_id, license_concluded, download_location
 		)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(sbom_id, spdx_package_id) DO UPDATE SET
-			package_id = excluded.package_id,
+			package_version_id = excluded.package_version_id,
 			license_concluded = excluded.license_concluded,
 			download_location = excluded.download_location
 	`)
@@ -156,7 +156,7 @@ func (s *Store) IngestSBOMLinks(ctx context.Context, repoID int64, sbom *github.
 
 	externalRefStmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO sbom_package_external_refs(
-			sbom_id, package_id, reference_category, reference_type, reference_locator
+			sbom_id, package_version_id, reference_category, reference_type, reference_locator
 		) VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT DO NOTHING
 	`)
@@ -167,7 +167,7 @@ func (s *Store) IngestSBOMLinks(ctx context.Context, repoID int64, sbom *github.
 
 	relationshipStmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO sbom_relationships(
-			sbom_id, from_package_id, to_package_id, relationship_type
+			sbom_id, from_package_version_id, to_package_version_id, relationship_type
 		)
 		VALUES (?, ?, ?, ?)
 		ON CONFLICT DO NOTHING
@@ -177,43 +177,43 @@ func (s *Store) IngestSBOMLinks(ctx context.Context, repoID int64, sbom *github.
 	}
 	defer relationshipStmt.Close()
 
-	packageBySPDX := make(map[string]int64, len(doc.Packages))
+	packageVersionBySPDX := make(map[string]int64, len(doc.Packages))
 	for i, pkg := range doc.Packages {
 		if pkg == nil {
 			continue
 		}
 		identity := sbomIdentityFromPackage(i, pkg)
-		packageID, err := resolvePackageIDTx(tx, identity.ecosystem, identity.name, identity.version, identity.purl)
+		packageVersionID, err := resolvePackageVersionIDTx(tx, identity.ecosystem, identity.name, identity.version, identity.purl)
 		if err != nil {
-			return fmt.Errorf("sbom package lookup failed (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q): %w", repoID, pkg.GetSPDXID(), identity.ecosystem, identity.name, identity.version, identity.purl, err)
+			return fmt.Errorf("sbom package version lookup failed (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q): %w", repoID, pkg.GetSPDXID(), identity.ecosystem, identity.name, identity.version, identity.purl, err)
 		}
-		if packageID == 0 {
-			return fmt.Errorf("sbom package not found for links (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q)", repoID, pkg.GetSPDXID(), identity.ecosystem, identity.name, identity.version, identity.purl)
+		if packageVersionID == 0 {
+			return fmt.Errorf("sbom package version not found for links (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q)", repoID, pkg.GetSPDXID(), identity.ecosystem, identity.name, identity.version, identity.purl)
 		}
 		if spdxID := strings.TrimSpace(pkg.GetSPDXID()); spdxID != "" {
-			packageBySPDX[spdxID] = packageID
+			packageVersionBySPDX[spdxID] = packageVersionID
 		}
-		if _, err := repoPackageStmt.ExecContext(ctx, repoID, packageID); err != nil {
-			return fmt.Errorf("sbom repo_packages insert failed (repo_id=%d package_id=%d): %w", repoID, packageID, err)
+		if _, err := repoPackageVersionStmt.ExecContext(ctx, repoID, packageVersionID); err != nil {
+			return fmt.Errorf("sbom repo_package_versions insert failed (repo_id=%d package_version_id=%d): %w", repoID, packageVersionID, err)
 		}
 
 		if _, err := sbomDocPackageStmt.ExecContext(
 			ctx,
 			sbomID,
 			pkg.GetSPDXID(),
-			packageID,
+			packageVersionID,
 			pkg.GetLicenseConcluded(),
 			identity.downloadLocation,
 		); err != nil {
-			return fmt.Errorf("sbom document package insert failed (repo_id=%d sbom_id=%d spdx=%q package_id=%d): %w", repoID, sbomID, pkg.GetSPDXID(), packageID, err)
+			return fmt.Errorf("sbom document package insert failed (repo_id=%d sbom_id=%d spdx=%q package_version_id=%d): %w", repoID, sbomID, pkg.GetSPDXID(), packageVersionID, err)
 		}
 
 		for _, ref := range pkg.ExternalRefs {
 			if ref == nil {
 				continue
 			}
-			if _, err := externalRefStmt.ExecContext(ctx, sbomID, packageID, ref.ReferenceCategory, ref.ReferenceType, ref.ReferenceLocator); err != nil {
-				return fmt.Errorf("sbom external ref insert failed (repo_id=%d sbom_id=%d package_id=%d ref_type=%q locator=%q): %w", repoID, sbomID, packageID, ref.ReferenceType, ref.ReferenceLocator, err)
+			if _, err := externalRefStmt.ExecContext(ctx, sbomID, packageVersionID, ref.ReferenceCategory, ref.ReferenceType, ref.ReferenceLocator); err != nil {
+				return fmt.Errorf("sbom external ref insert failed (repo_id=%d sbom_id=%d package_version_id=%d ref_type=%q locator=%q): %w", repoID, sbomID, packageVersionID, ref.ReferenceType, ref.ReferenceLocator, err)
 			}
 		}
 	}
@@ -222,8 +222,8 @@ func (s *Store) IngestSBOMLinks(ctx context.Context, repoID int64, sbom *github.
 		if rel == nil {
 			continue
 		}
-		fromID, okFrom := packageBySPDX[rel.SPDXElementID]
-		toID, okTo := packageBySPDX[rel.RelatedSPDXElement]
+		fromID, okFrom := packageVersionBySPDX[rel.SPDXElementID]
+		toID, okTo := packageVersionBySPDX[rel.RelatedSPDXElement]
 		if !okFrom && !okTo {
 			continue
 		}
@@ -234,7 +234,7 @@ func (s *Store) IngestSBOMLinks(ctx context.Context, repoID int64, sbom *github.
 			nullableInt64(okTo, toID),
 			rel.RelationshipType,
 		); err != nil {
-			return fmt.Errorf("sbom relationship insert failed (repo_id=%d sbom_id=%d from_spdx=%q to_spdx=%q from_package_id=%v to_package_id=%v): %w", repoID, sbomID, rel.SPDXElementID, rel.RelatedSPDXElement, nullableInt64(okFrom, fromID), nullableInt64(okTo, toID), err)
+			return fmt.Errorf("sbom relationship insert failed (repo_id=%d sbom_id=%d from_spdx=%q to_spdx=%q from_package_version_id=%v to_package_version_id=%v): %w", repoID, sbomID, rel.SPDXElementID, rel.RelatedSPDXElement, nullableInt64(okFrom, fromID), nullableInt64(okTo, toID), err)
 		}
 	}
 
@@ -283,7 +283,7 @@ func upsertSBOMDocumentTx(ctx context.Context, tx *sql.Tx, repoID int64, doc *gi
 	return sbomID, nil
 }
 
-func upsertPackageKeyTx(tx *sql.Tx, ecosystem, name string) (int64, error) {
+func upsertPackageIdentityTx(tx *sql.Tx, ecosystem, name string) (int64, error) {
 	ecosystem = safeStr(ecosystem)
 	name = safeStr(name)
 	if ecosystem == "" {
@@ -293,23 +293,29 @@ func upsertPackageKeyTx(tx *sql.Tx, ecosystem, name string) (int64, error) {
 		return 0, nil
 	}
 	if _, err := tx.Exec(`
-		INSERT INTO package_keys(ecosystem, name)
+		INSERT INTO packages(ecosystem, name)
 		VALUES (?, ?)
 		ON CONFLICT(ecosystem, name) DO NOTHING
 	`, ecosystem, name); err != nil {
 		return 0, err
 	}
-	var packageKeyID int64
-	if err := tx.QueryRow(`
-		SELECT package_key_id FROM package_keys
+
+	var packageID int64
+	err := tx.QueryRow(`
+		SELECT package_id FROM packages
 		WHERE ecosystem = ? AND name = ?
-	`, ecosystem, name).Scan(&packageKeyID); err != nil {
+		LIMIT 1
+	`, ecosystem, name).Scan(&packageID)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
 		return 0, err
 	}
-	return packageKeyID, nil
+	return packageID, nil
 }
 
-func lookupPackageKeyIDTx(tx *sql.Tx, ecosystem, name string) (int64, error) {
+func lookupPackageIdentityIDTx(tx *sql.Tx, ecosystem, name string) (int64, error) {
 	ecosystem = safeStr(ecosystem)
 	name = safeStr(name)
 	if ecosystem == "" {
@@ -318,22 +324,23 @@ func lookupPackageKeyIDTx(tx *sql.Tx, ecosystem, name string) (int64, error) {
 	if name == "" {
 		return 0, nil
 	}
-	var packageKeyID int64
+
+	var packageID int64
 	err := tx.QueryRow(`
-		SELECT package_key_id FROM package_keys
+		SELECT package_id FROM packages
 		WHERE ecosystem = ? AND name = ?
 		LIMIT 1
-	`, ecosystem, name).Scan(&packageKeyID)
+	`, ecosystem, name).Scan(&packageID)
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
 	if err != nil {
 		return 0, err
 	}
-	return packageKeyID, nil
+	return packageID, nil
 }
 
-func resolvePackageIDTx(tx *sql.Tx, ecosystem, name, version, purl string) (int64, error) {
+func resolvePackageVersionIDTx(tx *sql.Tx, ecosystem, name, version, purl string) (int64, error) {
 	ecosystem = safeStr(ecosystem)
 	name = safeStr(name)
 	version = safeStr(version)
@@ -344,19 +351,25 @@ func resolvePackageIDTx(tx *sql.Tx, ecosystem, name, version, purl string) (int6
 	if name == "" {
 		return 0, nil
 	}
-	var packageID int64
-	err := tx.QueryRow(`
-		SELECT package_id FROM packages
-		WHERE ecosystem = ? AND name = ? AND version = ? AND purl = ?
+
+	packageID, err := lookupPackageIdentityIDTx(tx, ecosystem, name)
+	if err != nil || packageID == 0 {
+		return packageID, err
+	}
+
+	var packageVersionID int64
+	err = tx.QueryRow(`
+		SELECT package_version_id FROM package_versions
+		WHERE package_id = ? AND version = ? AND purl = ?
 		LIMIT 1
-	`, ecosystem, name, version, purl).Scan(&packageID)
+	`, packageID, version, purl).Scan(&packageVersionID)
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
 	if err != nil {
 		return 0, err
 	}
-	return packageID, nil
+	return packageVersionID, nil
 }
 
 func upsertPackageTx(tx *sql.Tx, ecosystem, name, version, purl, license, supplier, licenseDeclared, downloadLocation string, filesAnalyzed interface{}) (int64, error) {
@@ -370,43 +383,41 @@ func upsertPackageTx(tx *sql.Tx, ecosystem, name, version, purl, license, suppli
 	if name == "" {
 		return 0, nil
 	}
-	packageKeyID, err := upsertPackageKeyTx(tx, ecosystem, name)
+
+	packageID, err := upsertPackageIdentityTx(tx, ecosystem, name)
 	if err != nil {
 		return 0, err
 	}
-	if packageKeyID == 0 {
+	if packageID == 0 {
 		return 0, nil
 	}
 
-	res, err := tx.Exec(`
-		INSERT INTO packages(package_key_id, ecosystem, name, version, purl, license, supplier, license_declared, download_location, files_analyzed)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(ecosystem, name, version, purl) DO NOTHING
-	`, packageKeyID, ecosystem, name, version, purl, license, supplier, licenseDeclared, downloadLocation, filesAnalyzed)
-	if err != nil {
+	if _, err := tx.Exec(`
+		INSERT INTO package_versions(package_id, version, purl, license, supplier, license_declared, download_location, files_analyzed)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(package_id, version, purl) DO NOTHING
+	`, packageID, version, purl, license, supplier, licenseDeclared, downloadLocation, filesAnalyzed); err != nil {
 		return 0, err
 	}
-	_, _ = res.RowsAffected()
 
-	var packageID int64
+	var packageVersionID int64
 	if err := tx.QueryRow(`
-		SELECT package_id FROM packages
-		WHERE ecosystem = ? AND name = ? AND version = ? AND purl = ?
-	`, ecosystem, name, version, purl).Scan(&packageID); err != nil {
+		SELECT package_version_id FROM package_versions
+		WHERE package_id = ? AND version = ? AND purl = ?
+	`, packageID, version, purl).Scan(&packageVersionID); err != nil {
 		return 0, err
 	}
 	if _, err := tx.Exec(`
-		UPDATE packages
+		UPDATE package_versions
 		SET
-			package_key_id = ?,
 			license = COALESCE(NULLIF(?, ''), license),
 			supplier = COALESCE(NULLIF(?, ''), supplier),
 			license_declared = COALESCE(NULLIF(?, ''), license_declared),
 			download_location = COALESCE(NULLIF(?, ''), download_location),
 			files_analyzed = COALESCE(?, files_analyzed)
-		WHERE package_id = ?
-	`, packageKeyID, license, supplier, licenseDeclared, downloadLocation, filesAnalyzed, packageID); err != nil {
+		WHERE package_version_id = ?
+	`, license, supplier, licenseDeclared, downloadLocation, filesAnalyzed, packageVersionID); err != nil {
 		return 0, err
 	}
-	return packageID, nil
+	return packageVersionID, nil
 }

@@ -26,14 +26,14 @@ func (s *Store) IngestDependabotAlertsMain(ctx context.Context, repoIDByName Rep
 
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO dependabot_alerts(
-			repo_id, alert_number, state, severity, package_key_id, manifest_path, created_at,
+			repo_id, alert_number, state, severity, package_id, manifest_path, created_at,
 			updated_at, fixed_at, dismissed_reason, url, html_url, dismissed_at, dismissed_comment,
 			auto_dismissed_at, dependency_scope
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(repo_id, alert_number) DO UPDATE SET
 			state = excluded.state,
 			severity = excluded.severity,
-			package_key_id = excluded.package_key_id,
+			package_id = excluded.package_id,
 			manifest_path = excluded.manifest_path,
 			created_at = excluded.created_at,
 			updated_at = excluded.updated_at,
@@ -72,7 +72,7 @@ func (s *Store) IngestDependabotAlertsMain(ctx context.Context, repoIDByName Rep
 		pkgName := firstNonEmpty(depPackage.GetName(), secPackage.GetName())
 		severity := strings.ToLower(firstNonEmpty(securityVuln.GetSeverity(), securityAdv.GetSeverity()))
 
-		packageKeyID, depErr := upsertPackageKeyTx(tx, ecosystem, pkgName)
+		packageID, depErr := upsertPackageIdentityTx(tx, ecosystem, pkgName)
 		if depErr != nil {
 			return depErr
 		}
@@ -83,7 +83,7 @@ func (s *Store) IngestDependabotAlertsMain(ctx context.Context, repoIDByName Rep
 			a.GetNumber(),
 			a.GetState(),
 			severity,
-			nullableInt64Value(packageKeyID),
+			nullableInt64Value(packageID),
 			dependency.GetManifestPath(),
 			formatGitHubTimePtr(a.CreatedAt),
 			formatGitHubTimePtr(a.UpdatedAt),
@@ -405,7 +405,7 @@ func upsertDependabotAdvisoryMainTx(tx *sql.Tx, a *github.DependabotAlert) error
 			continue
 		}
 		pkg := v.GetPackage()
-		if _, err := upsertPackageKeyTx(tx, pkg.GetEcosystem(), pkg.GetName()); err != nil {
+		if _, err := upsertPackageIdentityTx(tx, pkg.GetEcosystem(), pkg.GetName()); err != nil {
 			return err
 		}
 	}
@@ -450,7 +450,7 @@ func rebuildDependabotAdvisoryLinksTx(tx *sql.Tx, advisoryID int64, adv *github.
 
 	vulnStmt, err := tx.Prepare(`
 		INSERT INTO advisory_vulnerabilities(
-			advisory_id, package_key_id, package_ordinal, severity, vulnerable_version_range,
+			advisory_id, package_id, package_ordinal, severity, vulnerable_version_range,
 			first_patched_version
 		) VALUES (?, ?, ?, ?, ?, ?)
 	`)
@@ -485,16 +485,16 @@ func rebuildDependabotAdvisoryLinksTx(tx *sql.Tx, advisoryID int64, adv *github.
 			continue
 		}
 		pkg := v.GetPackage()
-		packageKeyID, err := lookupPackageKeyIDTx(tx, pkg.GetEcosystem(), pkg.GetName())
+		packageID, err := lookupPackageIdentityIDTx(tx, pkg.GetEcosystem(), pkg.GetName())
 		if err != nil {
 			return err
 		}
-		if packageKeyID == 0 {
-			return fmt.Errorf("advisory package key not found for ecosystem=%q name=%q advisory_id=%d", pkg.GetEcosystem(), pkg.GetName(), advisoryID)
+		if packageID == 0 {
+			return fmt.Errorf("advisory package not found for ecosystem=%q name=%q advisory_id=%d", pkg.GetEcosystem(), pkg.GetName(), advisoryID)
 		}
-		packageOrdinals[packageKeyID]++
-		packageOrdinal := packageOrdinals[packageKeyID]
-		_, err = vulnStmt.Exec(advisoryID, packageKeyID, packageOrdinal, v.GetSeverity(),
+		packageOrdinals[packageID]++
+		packageOrdinal := packageOrdinals[packageID]
+		_, err = vulnStmt.Exec(advisoryID, packageID, packageOrdinal, v.GetSeverity(),
 			v.GetVulnerableVersionRange(), v.GetFirstPatchedVersion().GetIdentifier())
 		if err != nil {
 			return err

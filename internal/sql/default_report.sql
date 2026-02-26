@@ -38,21 +38,23 @@ SELECT
 		(SELECT sd.document_describes_count FROM sbom sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_document_describes_count,
 		(SELECT sd.package_count FROM sbom sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_package_count,
 		(SELECT sd.relationship_count FROM sbom sd WHERE sd.repo_id = r.repo_id LIMIT 1) AS sbom_relationship_count,
-	(SELECT COUNT(1) FROM repo_packages rp WHERE rp.repo_id = r.repo_id) AS dependency_count,
+	(SELECT COUNT(1) FROM repo_package_versions rpv WHERE rpv.repo_id = r.repo_id) AS dependency_count,
 	(
 		SELECT COALESCE(group_concat(
 			'package_id=' || p.package_id ||
+			';package_version_id=' || pv.package_version_id ||
 			';ecosystem=' || COALESCE(p.ecosystem, '') ||
 			';name=' || COALESCE(p.name, '') ||
-			';version=' || COALESCE(p.version, '') ||
-			';purl=' || COALESCE(p.purl, '') ||
-			';license=' || COALESCE(p.license, '') ||
-			';supplier=' || COALESCE(p.supplier, ''),
+			';version=' || COALESCE(pv.version, '') ||
+			';purl=' || COALESCE(pv.purl, '') ||
+			';license=' || COALESCE(pv.license, '') ||
+			';supplier=' || COALESCE(pv.supplier, ''),
 			char(10)
 		), '')
-		FROM repo_packages rp
-		JOIN packages p ON p.package_id = rp.package_id
-		WHERE rp.repo_id = r.repo_id
+		FROM repo_package_versions rpv
+		JOIN package_versions pv ON pv.package_version_id = rpv.package_version_id
+		JOIN packages p ON p.package_id = pv.package_id
+		WHERE rpv.repo_id = r.repo_id
 	) AS dependency_details,
 	(SELECT COUNT(1) FROM dependabot_alerts da WHERE da.repo_id = r.repo_id AND lower(da.state) = 'open') AS open_dependabot_alerts,
 	(SELECT COUNT(1) FROM dependabot_alerts da WHERE da.repo_id = r.repo_id AND lower(da.state) = 'open' AND lower(da.severity) = 'critical') AS open_critical_dependabot_alerts,
@@ -62,18 +64,18 @@ SELECT
 			'alert_number=' || da.alert_number ||
 			';state=' || COALESCE(da.state, '') ||
 			';severity=' || COALESCE(da.severity, '') ||
-			';ecosystem=' || COALESCE(pk.ecosystem, '') ||
-			';package_name=' || COALESCE(pk.name, '') ||
+			';ecosystem=' || COALESCE(p.ecosystem, '') ||
+			';package_name=' || COALESCE(p.name, '') ||
 			';manifest_path=' || COALESCE(da.manifest_path, '') ||
 			';created_at=' || COALESCE(da.created_at, '') ||
 			';updated_at=' || COALESCE(da.updated_at, '') ||
 			';fixed_at=' || COALESCE(da.fixed_at, '') ||
 			';dismissed_reason=' || COALESCE(da.dismissed_reason, '') ||
-			';package_key_id=' || COALESCE(CAST(da.package_key_id AS TEXT), ''),
+			';package_id=' || COALESCE(CAST(da.package_id AS TEXT), ''),
 			char(10)
 		), '')
 		FROM dependabot_alerts da
-		LEFT JOIN package_keys pk ON pk.package_key_id = da.package_key_id
+		LEFT JOIN packages p ON p.package_id = da.package_id
 		WHERE da.repo_id = r.repo_id
 	) AS dependabot_alert_details,
 	(SELECT COUNT(1) FROM code_scanning_alerts ca WHERE ca.repo_id = r.repo_id AND lower(ca.state) = 'open') AS open_code_scanning_alerts,

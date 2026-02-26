@@ -80,17 +80,15 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			FOREIGN KEY(repo_id) REFERENCES repos(repo_id),
 			FOREIGN KEY(scanner_id) REFERENCES scanners(scanner_id)
 		);`,
-		`CREATE TABLE IF NOT EXISTS package_keys (
-			package_key_id INTEGER PRIMARY KEY AUTOINCREMENT,
+		`CREATE TABLE IF NOT EXISTS packages (
+			package_id INTEGER PRIMARY KEY AUTOINCREMENT,
 			ecosystem TEXT NOT NULL DEFAULT '',
 			name TEXT NOT NULL DEFAULT '',
 			UNIQUE (ecosystem, name)
 		);`,
-		`CREATE TABLE IF NOT EXISTS packages (
-			package_id INTEGER PRIMARY KEY AUTOINCREMENT,
-			package_key_id INTEGER NOT NULL,
-			ecosystem TEXT NOT NULL DEFAULT '',
-			name TEXT NOT NULL DEFAULT '',
+		`CREATE TABLE IF NOT EXISTS package_versions (
+			package_version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			package_id INTEGER NOT NULL,
 			version TEXT NOT NULL DEFAULT '',
 			purl TEXT NOT NULL DEFAULT '',
 			license TEXT,
@@ -98,16 +96,16 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			license_declared TEXT,
 			download_location TEXT,
 			files_analyzed INTEGER,
-			UNIQUE (ecosystem, name, version, purl),
-			FOREIGN KEY(package_key_id) REFERENCES package_keys(package_key_id)
-		);`,
-		`CREATE TABLE IF NOT EXISTS repo_packages (
-			repo_id INTEGER NOT NULL,
-			package_id INTEGER NOT NULL,
-			source TEXT NOT NULL,
-			PRIMARY KEY (repo_id, package_id, source),
-			FOREIGN KEY(repo_id) REFERENCES repos(repo_id),
+			UNIQUE (package_id, version, purl),
 			FOREIGN KEY(package_id) REFERENCES packages(package_id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS repo_package_versions (
+			repo_id INTEGER NOT NULL,
+			package_version_id INTEGER NOT NULL,
+			source TEXT NOT NULL,
+			PRIMARY KEY (repo_id, package_version_id, source),
+			FOREIGN KEY(repo_id) REFERENCES repos(repo_id),
+			FOREIGN KEY(package_version_id) REFERENCES package_versions(package_version_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS sbom (
 			sbom_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,39 +125,39 @@ func (s *Store) InitSchema(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS sbom_packages (
 			sbom_id INTEGER NOT NULL,
 			spdx_package_id TEXT NOT NULL,
-			package_id INTEGER,
+			package_version_id INTEGER,
 			license_concluded TEXT,
 			download_location TEXT,
 			PRIMARY KEY (sbom_id, spdx_package_id),
 			FOREIGN KEY(sbom_id) REFERENCES sbom(sbom_id),
-			FOREIGN KEY(package_id) REFERENCES packages(package_id)
+			FOREIGN KEY(package_version_id) REFERENCES package_versions(package_version_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS sbom_package_external_refs (
 			sbom_id INTEGER NOT NULL,
-			package_id INTEGER NOT NULL,
+			package_version_id INTEGER NOT NULL,
 			reference_category TEXT,
 			reference_type TEXT,
 			reference_locator TEXT,
-			PRIMARY KEY (sbom_id, package_id, reference_category, reference_type, reference_locator),
+			PRIMARY KEY (sbom_id, package_version_id, reference_category, reference_type, reference_locator),
 			FOREIGN KEY(sbom_id) REFERENCES sbom(sbom_id),
-			FOREIGN KEY(package_id) REFERENCES packages(package_id)
+			FOREIGN KEY(package_version_id) REFERENCES package_versions(package_version_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS sbom_relationships (
 			sbom_id INTEGER NOT NULL,
-			from_package_id INTEGER,
-			to_package_id INTEGER,
+			from_package_version_id INTEGER,
+			to_package_version_id INTEGER,
 			relationship_type TEXT NOT NULL,
-			PRIMARY KEY (sbom_id, from_package_id, to_package_id, relationship_type),
+			PRIMARY KEY (sbom_id, from_package_version_id, to_package_version_id, relationship_type),
 			FOREIGN KEY(sbom_id) REFERENCES sbom(sbom_id),
-			FOREIGN KEY(from_package_id) REFERENCES packages(package_id),
-			FOREIGN KEY(to_package_id) REFERENCES packages(package_id)
+			FOREIGN KEY(from_package_version_id) REFERENCES package_versions(package_version_id),
+			FOREIGN KEY(to_package_version_id) REFERENCES package_versions(package_version_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS dependabot_alerts (
 			repo_id INTEGER NOT NULL,
 			alert_number INTEGER NOT NULL,
 			state TEXT,
 			severity TEXT,
-			package_key_id INTEGER,
+			package_id INTEGER,
 			manifest_path TEXT,
 			created_at TEXT,
 			updated_at TEXT,
@@ -173,7 +171,7 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			dependency_scope TEXT,
 			PRIMARY KEY (repo_id, alert_number),
 			FOREIGN KEY(repo_id) REFERENCES repos(repo_id),
-			FOREIGN KEY(package_key_id) REFERENCES package_keys(package_key_id)
+			FOREIGN KEY(package_id) REFERENCES packages(package_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS advisories (
 			advisory_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -201,14 +199,14 @@ func (s *Store) InitSchema(ctx context.Context) error {
 		);`,
 		`CREATE TABLE IF NOT EXISTS advisory_vulnerabilities (
 			advisory_id INTEGER NOT NULL,
-			package_key_id INTEGER NOT NULL,
+			package_id INTEGER NOT NULL,
 			package_ordinal INTEGER NOT NULL,
 			severity TEXT,
 			vulnerable_version_range TEXT,
 			first_patched_version TEXT,
-			PRIMARY KEY (advisory_id, package_key_id, package_ordinal),
+			PRIMARY KEY (advisory_id, package_id, package_ordinal),
 			FOREIGN KEY(advisory_id) REFERENCES advisories(advisory_id),
-			FOREIGN KEY(package_key_id) REFERENCES package_keys(package_key_id)
+			FOREIGN KEY(package_id) REFERENCES packages(package_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS advisory_references (
 			reference_id INTEGER PRIMARY KEY AUTOINCREMENT,
