@@ -102,8 +102,7 @@ func (s *Store) InitSchema(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS repo_package_versions (
 			repo_id INTEGER NOT NULL,
 			package_version_id INTEGER NOT NULL,
-			source TEXT NOT NULL,
-			PRIMARY KEY (repo_id, package_version_id, source),
+			PRIMARY KEY (repo_id, package_version_id),
 			FOREIGN KEY(repo_id) REFERENCES repos(repo_id),
 			FOREIGN KEY(package_version_id) REFERENCES package_versions(package_version_id)
 		);`,
@@ -158,6 +157,7 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			state TEXT,
 			severity TEXT,
 			package_id INTEGER,
+			package_version_id INTEGER,
 			manifest_path TEXT,
 			created_at TEXT,
 			updated_at TEXT,
@@ -171,7 +171,8 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			dependency_scope TEXT,
 			PRIMARY KEY (repo_id, alert_number),
 			FOREIGN KEY(repo_id) REFERENCES repos(repo_id),
-			FOREIGN KEY(package_id) REFERENCES packages(package_id)
+			FOREIGN KEY(package_id) REFERENCES packages(package_id),
+			FOREIGN KEY(package_version_id) REFERENCES package_versions(package_version_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS advisories (
 			advisory_id INTEGER PRIMARY KEY AUTOINCREMENT,

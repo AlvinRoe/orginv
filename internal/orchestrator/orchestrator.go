@@ -56,6 +56,7 @@ type Store interface {
 	IngestSBOMLinks(ctx context.Context, repoID int64, sbom *gogithub.SBOM) error
 	IngestDependabotAlertsMain(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.DependabotAlert) error
 	IngestDependabotAlertsLinks(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.DependabotAlert) error
+	InferDependabotAlertPackageVersions(ctx context.Context) error
 	IngestCodeScanningAlerts(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.Alert) error
 	IngestSecretScanningAlerts(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.SecretScanningAlert) error
 	QueryReportData(ctx context.Context) (sqlite.ReportData, error)
@@ -94,7 +95,7 @@ func (r *Runner) LoadRepos(ctx context.Context) (RepoLoadResult, error) {
 func (r *Runner) RunDataPipelines(ctx context.Context, repos RepoLoadResult) []string {
 	collector := &fetchCollector{
 		mainWriteOps: make([]dbWriteOp, 0, len(repos.ActiveRepos)*2+3),
-		linkWriteOps: make([]dbWriteOp, 0, len(repos.ActiveRepos)*2+3),
+		linkWriteOps: make([]dbWriteOp, 0, len(repos.ActiveRepos)*2+4),
 	}
 
 	log.Printf("stage ingestion: fetching org-level alert datasets")
@@ -102,6 +103,14 @@ func (r *Runner) RunDataPipelines(ctx context.Context, repos RepoLoadResult) []s
 
 	log.Printf("stage ingestion: fetching per-repo datasets (sbom)")
 	r.fetchSBOMDatasets(ctx, repos.ActiveRepos, collector)
+
+	collector.enqueueLinkWriteOp(dbWriteOp{
+		name: "zzz dependabot package version inference",
+		rows: 0,
+		apply: func(ctx context.Context) error {
+			return r.store.InferDependabotAlertPackageVersions(ctx)
+		},
+	})
 
 	mainErrors := r.executeWriteOps(ctx, "main", collector.mainWriteOps, collector.errors)
 	return r.executeWriteOps(ctx, "link", collector.linkWriteOps, mainErrors)

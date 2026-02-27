@@ -25,17 +25,18 @@ func (s *Store) IngestDependabotAlertsMain(ctx context.Context, repoIDByName Rep
 	defer tx.Rollback()
 
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO dependabot_alerts(
-			repo_id, alert_number, state, severity, package_id, manifest_path, created_at,
-			updated_at, fixed_at, dismissed_reason, url, html_url, dismissed_at, dismissed_comment,
-			auto_dismissed_at, dependency_scope
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(repo_id, alert_number) DO UPDATE SET
-			state = excluded.state,
-			severity = excluded.severity,
-			package_id = excluded.package_id,
-			manifest_path = excluded.manifest_path,
-			created_at = excluded.created_at,
+			INSERT INTO dependabot_alerts(
+				repo_id, alert_number, state, severity, package_id, package_version_id, manifest_path, created_at,
+				updated_at, fixed_at, dismissed_reason, url, html_url, dismissed_at, dismissed_comment,
+				auto_dismissed_at, dependency_scope
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(repo_id, alert_number) DO UPDATE SET
+				state = excluded.state,
+				severity = excluded.severity,
+				package_id = excluded.package_id,
+				package_version_id = excluded.package_version_id,
+				manifest_path = excluded.manifest_path,
+				created_at = excluded.created_at,
 			updated_at = excluded.updated_at,
 			fixed_at = excluded.fixed_at,
 			dismissed_reason = excluded.dismissed_reason,
@@ -84,6 +85,7 @@ func (s *Store) IngestDependabotAlertsMain(ctx context.Context, repoIDByName Rep
 			a.GetState(),
 			severity,
 			nullableInt64Value(packageID),
+			nil,
 			dependency.GetManifestPath(),
 			formatGitHubTimePtr(a.CreatedAt),
 			formatGitHubTimePtr(a.UpdatedAt),
@@ -152,6 +154,58 @@ func (s *Store) IngestDependabotAlertsLinks(ctx context.Context, repoIDByName Re
 			return err
 		}
 		rebuiltAdvisories[advisoryID] = struct{}{}
+	}
+
+	return tx.Commit()
+}
+
+func (s *Store) InferDependabotAlertPackageVersions(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Clear prior inference so reruns do not retain stale matches after SBOM changes.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE dependabot_alerts
+		SET package_version_id = NULL
+	`); err != nil {
+		return err
+	}
+
+	// Only attach a package_version_id when a repo has exactly one observed version
+	// for the alerted package. Multiple installed versions remain ambiguous.
+	if _, err := tx.ExecContext(ctx, `
+		WITH resolved AS (
+			SELECT
+				da.repo_id,
+				da.alert_number,
+				MIN(rpv.package_version_id) AS package_version_id
+			FROM dependabot_alerts da
+			JOIN repo_package_versions rpv
+				ON rpv.repo_id = da.repo_id
+			JOIN package_versions pv
+				ON pv.package_version_id = rpv.package_version_id
+				AND pv.package_id = da.package_id
+			GROUP BY da.repo_id, da.alert_number
+			HAVING COUNT(DISTINCT rpv.package_version_id) = 1
+		)
+		UPDATE dependabot_alerts
+		SET package_version_id = (
+			SELECT resolved.package_version_id
+			FROM resolved
+			WHERE resolved.repo_id = dependabot_alerts.repo_id
+				AND resolved.alert_number = dependabot_alerts.alert_number
+		)
+		WHERE EXISTS (
+			SELECT 1
+			FROM resolved
+			WHERE resolved.repo_id = dependabot_alerts.repo_id
+				AND resolved.alert_number = dependabot_alerts.alert_number
+		)
+	`); err != nil {
+		return err
 	}
 
 	return tx.Commit()

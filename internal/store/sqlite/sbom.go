@@ -130,9 +130,9 @@ func (s *Store) IngestSBOMLinks(ctx context.Context, repoID int64, sbom *github.
 	}
 
 	repoPackageVersionStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO repo_package_versions(repo_id, package_version_id, source)
-		VALUES (?, ?, 'sbom')
-		ON CONFLICT(repo_id, package_version_id, source) DO NOTHING
+		INSERT INTO repo_package_versions(repo_id, package_version_id)
+		VALUES (?, ?)
+		ON CONFLICT(repo_id, package_version_id) DO NOTHING
 	`)
 	if err != nil {
 		return err
