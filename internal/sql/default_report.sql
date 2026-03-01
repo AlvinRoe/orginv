@@ -66,9 +66,6 @@ SELECT
 			';severity=' || COALESCE(da.severity, '') ||
 			';ecosystem=' || COALESCE(p.ecosystem, '') ||
 			';package_name=' || COALESCE(p.name, '') ||
-			';package_version_id=' || COALESCE(CAST(da.package_version_id AS TEXT), '') ||
-			';package_version=' || COALESCE(pv.version, '') ||
-			';package_purl=' || COALESCE(pv.purl, '') ||
 			';manifest_path=' || COALESCE(da.manifest_path, '') ||
 			';created_at=' || COALESCE(da.created_at, '') ||
 			';updated_at=' || COALESCE(da.updated_at, '') ||
@@ -79,7 +76,6 @@ SELECT
 		), '')
 		FROM dependabot_alerts da
 		LEFT JOIN packages p ON p.package_id = da.package_id
-		LEFT JOIN package_versions pv ON pv.package_version_id = da.package_version_id
 		WHERE da.repo_id = r.repo_id
 	) AS dependabot_alert_details,
 	(SELECT COUNT(1) FROM code_scanning_alerts ca WHERE ca.repo_id = r.repo_id AND lower(ca.state) = 'open') AS open_code_scanning_alerts,
@@ -116,7 +112,25 @@ SELECT
 		), '')
 		FROM secret_alerts sa
 		WHERE sa.repo_id = r.repo_id
-	) AS secret_scanning_alert_details
+	) AS secret_scanning_alert_details,
+	(SELECT COUNT(1) FROM vulnerable_repo_packages vrp WHERE vrp.repo_id = r.repo_id) AS vulnerable_package_count,
+	(
+		SELECT COALESCE(group_concat(
+			'package_id=' || vrp.package_id ||
+			';package_version_id=' || vrp.package_version_id ||
+			';ecosystem=' || COALESCE(vrp.ecosystem, '') ||
+			';package_name=' || COALESCE(vrp.package_name, '') ||
+			';package_version=' || COALESCE(vrp.package_version, '') ||
+			';vulnerable_range=' || COALESCE(vrp.vulnerable_version_range, '') ||
+			';first_patched_version=' || COALESCE(vrp.first_patched_version, '') ||
+			';advisory_severity=' || COALESCE(vrp.advisory_severity, '') ||
+			';ghsa_id=' || COALESCE(vrp.ghsa_id, '') ||
+			';cve_id=' || COALESCE(vrp.cve_id, ''),
+			char(10)
+		), '')
+		FROM vulnerable_repo_packages vrp
+		WHERE vrp.repo_id = r.repo_id
+	) AS vulnerable_package_details
 	FROM repos r
 	WHERE lower(r.name) != '.github'
-ORDER BY open_critical_dependabot_alerts DESC, open_dependabot_alerts DESC, r.full_name ASC
+ORDER BY vulnerable_package_count DESC, open_critical_dependabot_alerts DESC, open_dependabot_alerts DESC, r.full_name ASC

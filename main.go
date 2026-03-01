@@ -35,15 +35,8 @@ func main() {
 	store := sqlite.New(db, cfg.ReportSQLPath)
 	runner := orchestrator.NewRunner(cfg, client, store)
 
-	if err := runner.Bootstrap(ctx); err != nil {
-		log.Fatal(err)
-	}
-	repos, err := runner.LoadRepos(ctx)
+	errorsSeen, err := runner.Run(ctx)
 	if err != nil {
-		log.Fatal(err)
-	}
-	errorsSeen := runner.RunDataPipelines(ctx, repos)
-	if err := runner.ExportReport(ctx); err != nil {
 		log.Fatal(err)
 	}
 	runner.Finalize(errorsSeen)

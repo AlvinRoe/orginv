@@ -21,24 +21,24 @@ type Runner struct {
 	store  Store
 }
 
-type RepoLoadResult struct {
-	RepoIDByName sqlite.RepoIndex
+type RunContext struct {
+	Config config.Config
+
+	Repos        []*gogithub.Repository
 	ActiveRepos  []*gogithub.Repository
+	RepoIDByName sqlite.RepoIndex
+
+	DependabotAlerts     []*gogithub.DependabotAlert
+	CodeScanningAlerts   []*gogithub.Alert
+	SecretScanningAlerts []*gogithub.SecretScanningAlert
+	SBOMByRepoID         map[int64]*gogithub.SBOM
+
+	Errors []string
 }
 
-type dbWriteOp struct {
-	name  string
-	rows  int
-	apply func(context.Context) error
-}
-
-type fetchCollector struct {
-	writeOpsMu   sync.Mutex
-	mainWriteOps []dbWriteOp
-	linkWriteOps []dbWriteOp
-
-	errorsMu sync.Mutex
-	errors   []string
+type Stage interface {
+	Name() string
+	Run(context.Context, *RunContext) error
 }
 
 type RepoFetcher interface {
@@ -56,9 +56,9 @@ type Store interface {
 	IngestSBOMLinks(ctx context.Context, repoID int64, sbom *gogithub.SBOM) error
 	IngestDependabotAlertsMain(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.DependabotAlert) error
 	IngestDependabotAlertsLinks(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.DependabotAlert) error
-	InferDependabotAlertPackageVersions(ctx context.Context) error
 	IngestCodeScanningAlerts(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.Alert) error
 	IngestSecretScanningAlerts(ctx context.Context, repoIDByName sqlite.RepoIndex, alerts []*gogithub.SecretScanningAlert) error
+	RefreshVulnerableRepoPackages(ctx context.Context) error
 	QueryReportData(ctx context.Context) (sqlite.ReportData, error)
 }
 
@@ -66,227 +66,32 @@ func NewRunner(cfg config.Config, client RepoFetcher, store Store) *Runner {
 	return &Runner{cfg: cfg, client: client, store: store}
 }
 
-func (r *Runner) Bootstrap(ctx context.Context) error {
-	if err := r.store.InitSchema(ctx); err != nil {
-		return fmt.Errorf("failed to initialize sqlite schema: %w", err)
+func (r *Runner) Run(ctx context.Context) ([]string, error) {
+	rc := &RunContext{
+		Config:       r.cfg,
+		SBOMByRepoID: make(map[int64]*gogithub.SBOM),
+		Errors:       make([]string, 0, 16),
 	}
-	return nil
-}
-
-func (r *Runner) LoadRepos(ctx context.Context) (RepoLoadResult, error) {
-	repos, err := r.client.FetchAllRepos(ctx, r.cfg.Org, r.cfg.ResultsPerPage)
-	if err != nil {
-		return RepoLoadResult{}, fmt.Errorf("failed to fetch repositories: %w", err)
-	}
-	log.Printf("found %d repos", len(repos))
-
-	repoIDByName, activeRepos, err := r.store.UpsertRepos(ctx, r.cfg.Org, repos)
-	if err != nil {
-		return RepoLoadResult{}, fmt.Errorf("failed to persist repositories: %w", err)
+	stages := []Stage{
+		initSchemaStage{store: r.store},
+		loadReposStage{runner: r},
+		fetchDatasetsStage{runner: r},
+		ingestMainStage{store: r.store},
+		ingestLinksStage{store: r.store},
+		deriveVulnerablePackagesStage{store: r.store},
+		reportStage{store: r.store, outputPath: r.cfg.CSVOutputPath},
 	}
 
-	log.Printf("active repos: %d", len(activeRepos))
-	return RepoLoadResult{
-		RepoIDByName: repoIDByName,
-		ActiveRepos:  activeRepos,
-	}, nil
-}
-
-func (r *Runner) RunDataPipelines(ctx context.Context, repos RepoLoadResult) []string {
-	collector := &fetchCollector{
-		mainWriteOps: make([]dbWriteOp, 0, len(repos.ActiveRepos)*2+3),
-		linkWriteOps: make([]dbWriteOp, 0, len(repos.ActiveRepos)*2+4),
-	}
-
-	log.Printf("stage ingestion: fetching org-level alert datasets")
-	r.fetchOrgAlertDatasets(ctx, repos, collector)
-
-	log.Printf("stage ingestion: fetching per-repo datasets (sbom)")
-	r.fetchSBOMDatasets(ctx, repos.ActiveRepos, collector)
-
-	collector.enqueueLinkWriteOp(dbWriteOp{
-		name: "zzz dependabot package version inference",
-		rows: 0,
-		apply: func(ctx context.Context) error {
-			return r.store.InferDependabotAlertPackageVersions(ctx)
-		},
-	})
-
-	mainErrors := r.executeWriteOps(ctx, "main", collector.mainWriteOps, collector.errors)
-	return r.executeWriteOps(ctx, "link", collector.linkWriteOps, mainErrors)
-}
-
-func (r *Runner) fetchOrgAlertDatasets(ctx context.Context, repos RepoLoadResult, collector *fetchCollector) {
-	var orgWG sync.WaitGroup
-	orgFetch := []struct {
-		name string
-		run  func(context.Context) error
-	}{
-		{
-			name: "dependabot",
-			run: func(ctx context.Context) error {
-				alerts, pages, err := r.client.FetchDependabotAlerts(ctx, r.cfg.Org, r.cfg.ResultsPerPage)
-				if err != nil {
-					return err
-				}
-				log.Printf("dependabot fetch complete: pages=%d alerts=%d", pages, len(alerts))
-				collector.enqueueMainWriteOp(dbWriteOp{
-					name: "dependabot alerts",
-					rows: len(alerts),
-					apply: func(ctx context.Context) error {
-						return r.store.IngestDependabotAlertsMain(ctx, repos.RepoIDByName, alerts)
-					},
-				})
-				collector.enqueueLinkWriteOp(dbWriteOp{
-					name: "dependabot advisory links",
-					rows: len(alerts),
-					apply: func(ctx context.Context) error {
-						return r.store.IngestDependabotAlertsLinks(ctx, repos.RepoIDByName, alerts)
-					},
-				})
-				return nil
-			},
-		},
-		{
-			name: "code scanning",
-			run: func(ctx context.Context) error {
-				alerts, pages, err := r.client.FetchCodeScanningAlerts(ctx, r.cfg.Org, r.cfg.ResultsPerPage)
-				if err != nil {
-					return err
-				}
-				log.Printf("code scanning fetch complete: pages=%d alerts=%d", pages, len(alerts))
-				collector.enqueueMainWriteOp(dbWriteOp{
-					name: "code scanning alerts",
-					rows: len(alerts),
-					apply: func(ctx context.Context) error {
-						return r.store.IngestCodeScanningAlerts(ctx, repos.RepoIDByName, alerts)
-					},
-				})
-				return nil
-			},
-		},
-		{
-			name: "secret scanning",
-			run: func(ctx context.Context) error {
-				alerts, pages, err := r.client.FetchSecretScanningAlerts(ctx, r.cfg.Org, r.cfg.ResultsPerPage)
-				if err != nil {
-					return err
-				}
-				log.Printf("secret scanning fetch complete: pages=%d alerts=%d", pages, len(alerts))
-				collector.enqueueMainWriteOp(dbWriteOp{
-					name: "secret scanning alerts",
-					rows: len(alerts),
-					apply: func(ctx context.Context) error {
-						return r.store.IngestSecretScanningAlerts(ctx, repos.RepoIDByName, alerts)
-					},
-				})
-				return nil
-			},
-		},
-	}
-
-	for _, task := range orgFetch {
-		orgWG.Add(1)
-		go r.runOrgFetchTask(ctx, &orgWG, task.name, task.run, collector)
-	}
-	orgWG.Wait()
-}
-
-func (r *Runner) runOrgFetchTask(ctx context.Context, wg *sync.WaitGroup, taskName string, run func(context.Context) error, collector *fetchCollector) {
-	defer wg.Done()
-	started := time.Now()
-	log.Printf("%s fetch started", taskName)
-	if err := run(ctx); err != nil {
-		if isRateLimitErr(err) {
-			log.Fatalf("fatal: GitHub rate limit encountered during %s fetch: %v", taskName, err)
-		}
-		collector.recordErr(fmt.Sprintf("%s ingestion failed", taskName), err)
-		return
-	}
-	log.Printf("%s fetch/build done in %s", taskName, time.Since(started))
-}
-
-func (r *Runner) fetchSBOMDatasets(ctx context.Context, activeRepos []*gogithub.Repository, collector *fetchCollector) {
-	repoChan := make(chan *gogithub.Repository, len(activeRepos))
-	var repoWG sync.WaitGroup
-
-	for i := 0; i < r.cfg.SBOMWorkers; i++ {
-		repoWG.Add(1)
-		go func(workerID int) {
-			defer repoWG.Done()
-			for repo := range repoChan {
-				repoName := repo.GetName()
-				repoID := repo.GetID()
-				repoStart := time.Now()
-				log.Printf("worker %d fetch started for repo %s", workerID, repoName)
-
-				sbom, sbomErr := r.client.FetchSBOM(ctx, r.cfg.Org, repoName)
-				if sbomErr != nil {
-					if isRateLimitErr(sbomErr) {
-						log.Fatalf("fatal: GitHub rate limit encountered during sbom fetch (repo=%s): %v", repoName, sbomErr)
-					}
-					collector.recordErr(fmt.Sprintf("worker %d sbom %s", workerID, repoName), sbomErr)
-				} else {
-					collector.enqueueMainWriteOp(dbWriteOp{
-						name: fmt.Sprintf("sbom main %s", repoName),
-						rows: 1,
-						apply: func(ctx context.Context) error {
-							return r.store.IngestSBOMMain(ctx, repoID, sbom)
-						},
-					})
-					collector.enqueueLinkWriteOp(dbWriteOp{
-						name: fmt.Sprintf("sbom links %s", repoName),
-						rows: 1,
-						apply: func(ctx context.Context) error {
-							return r.store.IngestSBOMLinks(ctx, repoID, sbom)
-						},
-					})
-				}
-
-				log.Printf("worker %d fetch complete for repo %s in %s", workerID, repoName, time.Since(repoStart))
-			}
-		}(i + 1)
-	}
-
-	for _, repo := range activeRepos {
-		repoChan <- repo
-	}
-	close(repoChan)
-	repoWG.Wait()
-}
-
-func (r *Runner) executeWriteOps(ctx context.Context, phase string, writeOps []dbWriteOp, initialErrors []string) []string {
-	writeOps = append([]dbWriteOp(nil), writeOps...)
-	errorsSeen := append([]string(nil), initialErrors...)
-	log.Printf("stage writes (%s): queued db operations=%d", phase, len(writeOps))
-	sort.SliceStable(writeOps, func(i, j int) bool {
-		return writeOps[i].name < writeOps[j].name
-	})
-
-	for idx, op := range writeOps {
+	for _, stage := range stages {
 		started := time.Now()
-		log.Printf("db queue %d/%d start: %s (rows=%d)", idx+1, len(writeOps), op.name, op.rows)
-		if err := op.apply(ctx); err != nil {
-			msg := fmt.Sprintf("db write failed: %s: %v", op.name, err)
-			errorsSeen = append(errorsSeen, msg)
-			log.Printf("%s", msg)
-			continue
+		log.Printf("stage %s started", stage.Name())
+		if err := stage.Run(ctx, rc); err != nil {
+			return rc.Errors, fmt.Errorf("%s failed: %w", stage.Name(), err)
 		}
-		log.Printf("db queue %d/%d done: %s in %s", idx+1, len(writeOps), op.name, time.Since(started))
+		log.Printf("stage %s completed in %s", stage.Name(), time.Since(started))
 	}
 
-	return errorsSeen
-}
-
-func (r *Runner) ExportReport(ctx context.Context) error {
-	reportData, err := r.store.QueryReportData(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to export csv report: %w", err)
-	}
-	if err := exporter.WriteCSV(r.cfg.CSVOutputPath, reportData.Headers, reportData.Records); err != nil {
-		return fmt.Errorf("failed to write csv report: %w", err)
-	}
-	return nil
+	return rc.Errors, nil
 }
 
 func (r *Runner) Finalize(errorsSeen []string) {
@@ -298,23 +103,262 @@ func (r *Runner) Finalize(errorsSeen []string) {
 	log.Printf("csv output: %s", r.cfg.CSVOutputPath)
 }
 
-func (c *fetchCollector) recordErr(msg string, err error) {
-	c.errorsMu.Lock()
-	defer c.errorsMu.Unlock()
-	c.errors = append(c.errors, fmt.Sprintf("%s: %v", msg, err))
-	log.Printf("%s: %v", msg, err)
+type initSchemaStage struct {
+	store Store
 }
 
-func (c *fetchCollector) enqueueMainWriteOp(op dbWriteOp) {
-	c.writeOpsMu.Lock()
-	c.mainWriteOps = append(c.mainWriteOps, op)
-	c.writeOpsMu.Unlock()
+func (s initSchemaStage) Name() string { return "init-schema" }
+
+func (s initSchemaStage) Run(ctx context.Context, rc *RunContext) error {
+	return s.store.InitSchema(ctx)
 }
 
-func (c *fetchCollector) enqueueLinkWriteOp(op dbWriteOp) {
-	c.writeOpsMu.Lock()
-	c.linkWriteOps = append(c.linkWriteOps, op)
-	c.writeOpsMu.Unlock()
+type loadReposStage struct {
+	runner *Runner
+}
+
+func (s loadReposStage) Name() string { return "load-repos" }
+
+func (s loadReposStage) Run(ctx context.Context, rc *RunContext) error {
+	repos, err := s.runner.client.FetchAllRepos(ctx, s.runner.cfg.Org, s.runner.cfg.ResultsPerPage)
+	if err != nil {
+		return fmt.Errorf("failed to fetch repositories: %w", err)
+	}
+	log.Printf("found %d repos", len(repos))
+
+	repoIDByName, activeRepos, err := s.runner.store.UpsertRepos(ctx, s.runner.cfg.Org, repos)
+	if err != nil {
+		return fmt.Errorf("failed to persist repositories: %w", err)
+	}
+
+	rc.Repos = repos
+	rc.ActiveRepos = activeRepos
+	rc.RepoIDByName = repoIDByName
+	log.Printf("active repos: %d", len(activeRepos))
+	return nil
+}
+
+type fetchDatasetsStage struct {
+	runner *Runner
+}
+
+func (s fetchDatasetsStage) Name() string { return "fetch-datasets" }
+
+func (s fetchDatasetsStage) Run(ctx context.Context, rc *RunContext) error {
+	var (
+		wg     sync.WaitGroup
+		errMu  sync.Mutex
+		dataMu sync.Mutex
+	)
+
+	recordErr := func(label string, err error) {
+		if err == nil {
+			return
+		}
+		errMu.Lock()
+		rc.Errors = append(rc.Errors, fmt.Sprintf("%s: %v", label, err))
+		errMu.Unlock()
+		log.Printf("%s: %v", label, err)
+	}
+
+	orgTasks := []struct {
+		name string
+		run  func(context.Context) error
+	}{
+		{
+			name: "dependabot",
+			run: func(ctx context.Context) error {
+				alerts, pages, err := s.runner.client.FetchDependabotAlerts(ctx, s.runner.cfg.Org, s.runner.cfg.ResultsPerPage)
+				if err != nil {
+					return err
+				}
+				log.Printf("dependabot fetch complete: pages=%d alerts=%d", pages, len(alerts))
+				dataMu.Lock()
+				rc.DependabotAlerts = alerts
+				dataMu.Unlock()
+				return nil
+			},
+		},
+		{
+			name: "code scanning",
+			run: func(ctx context.Context) error {
+				alerts, pages, err := s.runner.client.FetchCodeScanningAlerts(ctx, s.runner.cfg.Org, s.runner.cfg.ResultsPerPage)
+				if err != nil {
+					return err
+				}
+				log.Printf("code scanning fetch complete: pages=%d alerts=%d", pages, len(alerts))
+				dataMu.Lock()
+				rc.CodeScanningAlerts = alerts
+				dataMu.Unlock()
+				return nil
+			},
+		},
+		{
+			name: "secret scanning",
+			run: func(ctx context.Context) error {
+				alerts, pages, err := s.runner.client.FetchSecretScanningAlerts(ctx, s.runner.cfg.Org, s.runner.cfg.ResultsPerPage)
+				if err != nil {
+					return err
+				}
+				log.Printf("secret scanning fetch complete: pages=%d alerts=%d", pages, len(alerts))
+				dataMu.Lock()
+				rc.SecretScanningAlerts = alerts
+				dataMu.Unlock()
+				return nil
+			},
+		},
+	}
+
+	for _, task := range orgTasks {
+		task := task
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			started := time.Now()
+			log.Printf("%s fetch started", task.name)
+			if err := task.run(ctx); err != nil {
+				if isRateLimitErr(err) {
+					log.Fatalf("fatal: GitHub rate limit encountered during %s fetch: %v", task.name, err)
+				}
+				recordErr(task.name, err)
+				return
+			}
+			log.Printf("%s fetch completed in %s", task.name, time.Since(started))
+		}()
+	}
+
+	repoChan := make(chan *gogithub.Repository, len(rc.ActiveRepos))
+	var sbomWG sync.WaitGroup
+	for i := 0; i < s.runner.cfg.SBOMWorkers; i++ {
+		sbomWG.Add(1)
+		go func(workerID int) {
+			defer sbomWG.Done()
+			for repo := range repoChan {
+				repoName := repo.GetName()
+				repoID := repo.GetID()
+				started := time.Now()
+				log.Printf("worker %d sbom fetch started for %s", workerID, repoName)
+				sbom, err := s.runner.client.FetchSBOM(ctx, s.runner.cfg.Org, repoName)
+				if err != nil {
+					if isRateLimitErr(err) {
+						log.Fatalf("fatal: GitHub rate limit encountered during sbom fetch (repo=%s): %v", repoName, err)
+					}
+					recordErr(fmt.Sprintf("sbom %s", repoName), err)
+					continue
+				}
+				dataMu.Lock()
+				rc.SBOMByRepoID[repoID] = sbom
+				dataMu.Unlock()
+				log.Printf("worker %d sbom fetch completed for %s in %s", workerID, repoName, time.Since(started))
+			}
+		}(i + 1)
+	}
+
+	for _, repo := range rc.ActiveRepos {
+		repoChan <- repo
+	}
+	close(repoChan)
+
+	wg.Wait()
+	sbomWG.Wait()
+	return nil
+}
+
+type ingestMainStage struct {
+	store Store
+}
+
+func (s ingestMainStage) Name() string { return "ingest-main" }
+
+func (s ingestMainStage) Run(ctx context.Context, rc *RunContext) error {
+	for _, job := range []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "dependabot-main",
+			run:  func() error { return s.store.IngestDependabotAlertsMain(ctx, rc.RepoIDByName, rc.DependabotAlerts) },
+		},
+		{
+			name: "code-scanning",
+			run:  func() error { return s.store.IngestCodeScanningAlerts(ctx, rc.RepoIDByName, rc.CodeScanningAlerts) },
+		},
+		{
+			name: "secret-scanning",
+			run:  func() error { return s.store.IngestSecretScanningAlerts(ctx, rc.RepoIDByName, rc.SecretScanningAlerts) },
+		},
+	} {
+		if err := job.run(); err != nil {
+			rc.Errors = append(rc.Errors, fmt.Sprintf("%s: %v", job.name, err))
+		}
+	}
+
+	repoIDs := sortedRepoIDs(rc.SBOMByRepoID)
+	for _, repoID := range repoIDs {
+		if err := s.store.IngestSBOMMain(ctx, repoID, rc.SBOMByRepoID[repoID]); err != nil {
+			rc.Errors = append(rc.Errors, fmt.Sprintf("sbom-main repo=%d: %v", repoID, err))
+		}
+	}
+	return nil
+}
+
+type ingestLinksStage struct {
+	store Store
+}
+
+func (s ingestLinksStage) Name() string { return "ingest-links" }
+
+func (s ingestLinksStage) Run(ctx context.Context, rc *RunContext) error {
+	if err := s.store.IngestDependabotAlertsLinks(ctx, rc.RepoIDByName, rc.DependabotAlerts); err != nil {
+		rc.Errors = append(rc.Errors, fmt.Sprintf("dependabot-links: %v", err))
+	}
+	repoIDs := sortedRepoIDs(rc.SBOMByRepoID)
+	for _, repoID := range repoIDs {
+		if err := s.store.IngestSBOMLinks(ctx, repoID, rc.SBOMByRepoID[repoID]); err != nil {
+			rc.Errors = append(rc.Errors, fmt.Sprintf("sbom-links repo=%d: %v", repoID, err))
+		}
+	}
+	return nil
+}
+
+type deriveVulnerablePackagesStage struct {
+	store Store
+}
+
+func (s deriveVulnerablePackagesStage) Name() string { return "derive-vulnerable-packages" }
+
+func (s deriveVulnerablePackagesStage) Run(ctx context.Context, rc *RunContext) error {
+	if err := s.store.RefreshVulnerableRepoPackages(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+type reportStage struct {
+	store      Store
+	outputPath string
+}
+
+func (s reportStage) Name() string { return "report" }
+
+func (s reportStage) Run(ctx context.Context, rc *RunContext) error {
+	reportData, err := s.store.QueryReportData(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to query report: %w", err)
+	}
+	if err := exporter.WriteCSV(s.outputPath, reportData.Headers, reportData.Records); err != nil {
+		return fmt.Errorf("failed to write csv report: %w", err)
+	}
+	return nil
+}
+
+func sortedRepoIDs(m map[int64]*gogithub.SBOM) []int64 {
+	repoIDs := make([]int64, 0, len(m))
+	for repoID := range m {
+		repoIDs = append(repoIDs, repoID)
+	}
+	sort.Slice(repoIDs, func(i, j int) bool { return repoIDs[i] < repoIDs[j] })
+	return repoIDs
 }
 
 func isRateLimitErr(err error) bool {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/AlvinRoe/orginv/internal/store/sqlite/sqlbatch"
 	"github.com/google/go-github/v82/github"
 )
 
@@ -65,43 +66,19 @@ func (s *Store) IngestSBOMMain(ctx context.Context, repoID int64, sbom *github.S
 		return nil
 	}
 	doc := sbom.SBOM
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	if _, err := upsertSBOMDocumentTx(ctx, tx, repoID, doc); err != nil {
-		return err
-	}
+	batch := sqlbatch.New()
+	batch.Add("sbom", buildSBOMDocumentUpsertSQL(repoID, doc))
 
 	for i, pkg := range doc.Packages {
 		if pkg == nil {
 			continue
 		}
 		identity := sbomIdentityFromPackage(i, pkg)
-		packageVersionID, err := upsertPackageTx(
-			tx,
-			identity.ecosystem,
-			identity.name,
-			identity.version,
-			identity.purl,
-			identity.licenseConcluded,
-			"",
-			identity.licenseDeclared,
-			identity.downloadLocation,
-			identity.filesAnalyzed,
-		)
-		if err != nil {
-			return fmt.Errorf("sbom package upsert failed (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q): %w", repoID, pkg.GetSPDXID(), identity.ecosystem, identity.name, identity.version, identity.purl, err)
-		}
-		if packageVersionID == 0 {
-			return fmt.Errorf("sbom package version id is zero (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q)", repoID, pkg.GetSPDXID(), identity.ecosystem, identity.name, identity.version, identity.purl)
-		}
+		batch.Add("packages", buildPackageIdentityUpsertSQL(identity.ecosystem, identity.name))
+		batch.Add("package_versions", buildPackageVersionUpsertSQL(identity))
 	}
 
-	return tx.Commit()
+	return s.flushBatch(ctx, fmt.Sprintf("sbom main repo=%d", repoID), batch)
 }
 
 func (s *Store) IngestSBOMLinks(ctx context.Context, repoID int64, sbom *github.SBOM) error {
@@ -109,112 +86,58 @@ func (s *Store) IngestSBOMLinks(ctx context.Context, repoID int64, sbom *github.
 		return nil
 	}
 	doc := sbom.SBOM
+	batch := sqlbatch.New()
+	batch.Add("repo_package_versions", fmt.Sprintf(`DELETE FROM repo_package_versions WHERE repo_id = %d`, repoID))
+	batch.Add("sbom_packages", fmt.Sprintf(`DELETE FROM sbom_packages WHERE sbom_id = %s`, sbomIDSubquery(repoID)))
+	batch.Add("sbom_package_external_refs", fmt.Sprintf(`DELETE FROM sbom_package_external_refs WHERE sbom_id = %s`, sbomIDSubquery(repoID)))
+	batch.Add("sbom_relationships", fmt.Sprintf(`DELETE FROM sbom_relationships WHERE sbom_id = %s`, sbomIDSubquery(repoID)))
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	sbomID, err := upsertSBOMDocumentTx(ctx, tx, repoID, doc)
-	if err != nil {
-		return err
-	}
-
-	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM sbom_packages WHERE sbom_id = ?;
-		DELETE FROM sbom_package_external_refs WHERE sbom_id = ?;
-		DELETE FROM sbom_relationships WHERE sbom_id = ?;
-	`, sbomID, sbomID, sbomID); err != nil {
-		return err
-	}
-
-	repoPackageVersionStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO repo_package_versions(repo_id, package_version_id)
-		VALUES (?, ?)
-		ON CONFLICT(repo_id, package_version_id) DO NOTHING
-	`)
-	if err != nil {
-		return err
-	}
-	defer repoPackageVersionStmt.Close()
-
-	sbomDocPackageStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO sbom_packages(
-			sbom_id, spdx_package_id, package_version_id, license_concluded, download_location
-		)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(sbom_id, spdx_package_id) DO UPDATE SET
-			package_version_id = excluded.package_version_id,
-			license_concluded = excluded.license_concluded,
-			download_location = excluded.download_location
-	`)
-	if err != nil {
-		return err
-	}
-	defer sbomDocPackageStmt.Close()
-
-	externalRefStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO sbom_package_external_refs(
-			sbom_id, package_version_id, reference_category, reference_type, reference_locator
-		) VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT DO NOTHING
-	`)
-	if err != nil {
-		return err
-	}
-	defer externalRefStmt.Close()
-
-	relationshipStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO sbom_relationships(
-			sbom_id, from_package_version_id, to_package_version_id, relationship_type
-		)
-		VALUES (?, ?, ?, ?)
-		ON CONFLICT DO NOTHING
-	`)
-	if err != nil {
-		return err
-	}
-	defer relationshipStmt.Close()
-
-	packageVersionBySPDX := make(map[string]int64, len(doc.Packages))
+	packageIdentityBySPDX := make(map[string]sbomPackageIdentity, len(doc.Packages))
 	for i, pkg := range doc.Packages {
 		if pkg == nil {
 			continue
 		}
 		identity := sbomIdentityFromPackage(i, pkg)
-		packageVersionID, err := resolvePackageVersionIDTx(tx, identity.ecosystem, identity.name, identity.version, identity.purl)
-		if err != nil {
-			return fmt.Errorf("sbom package version lookup failed (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q): %w", repoID, pkg.GetSPDXID(), identity.ecosystem, identity.name, identity.version, identity.purl, err)
-		}
-		if packageVersionID == 0 {
-			return fmt.Errorf("sbom package version not found for links (repo_id=%d spdx=%q ecosystem=%q name=%q version=%q purl=%q)", repoID, pkg.GetSPDXID(), identity.ecosystem, identity.name, identity.version, identity.purl)
-		}
 		if spdxID := strings.TrimSpace(pkg.GetSPDXID()); spdxID != "" {
-			packageVersionBySPDX[spdxID] = packageVersionID
+			packageIdentityBySPDX[spdxID] = identity
 		}
-		if _, err := repoPackageVersionStmt.ExecContext(ctx, repoID, packageVersionID); err != nil {
-			return fmt.Errorf("sbom repo_package_versions insert failed (repo_id=%d package_version_id=%d): %w", repoID, packageVersionID, err)
-		}
-
-		if _, err := sbomDocPackageStmt.ExecContext(
-			ctx,
-			sbomID,
-			pkg.GetSPDXID(),
-			packageVersionID,
-			pkg.GetLicenseConcluded(),
-			identity.downloadLocation,
-		); err != nil {
-			return fmt.Errorf("sbom document package insert failed (repo_id=%d sbom_id=%d spdx=%q package_version_id=%d): %w", repoID, sbomID, pkg.GetSPDXID(), packageVersionID, err)
-		}
+		packageVersionExpr := packageVersionIDSubquery(identity.ecosystem, identity.name, identity.version, identity.purl)
+		batch.Add("repo_package_versions", fmt.Sprintf(
+			`INSERT INTO repo_package_versions(repo_id, package_version_id)
+			VALUES (%d, %s)
+			ON CONFLICT(repo_id, package_version_id) DO NOTHING`,
+			repoID, packageVersionExpr,
+		))
+		batch.Add("sbom_packages", fmt.Sprintf(
+			`INSERT INTO sbom_packages(
+				sbom_id, spdx_package_id, package_version_id, license_concluded, download_location
+			) VALUES (%s, %s, %s, %s, %s)
+			ON CONFLICT(sbom_id, spdx_package_id) DO UPDATE SET
+				package_version_id = excluded.package_version_id,
+				license_concluded = excluded.license_concluded,
+				download_location = excluded.download_location`,
+			sbomIDSubquery(repoID),
+			sqlString(pkg.GetSPDXID()),
+			packageVersionExpr,
+			sqlString(pkg.GetLicenseConcluded()),
+			sqlString(identity.downloadLocation),
+		))
 
 		for _, ref := range pkg.ExternalRefs {
 			if ref == nil {
 				continue
 			}
-			if _, err := externalRefStmt.ExecContext(ctx, sbomID, packageVersionID, ref.ReferenceCategory, ref.ReferenceType, ref.ReferenceLocator); err != nil {
-				return fmt.Errorf("sbom external ref insert failed (repo_id=%d sbom_id=%d package_version_id=%d ref_type=%q locator=%q): %w", repoID, sbomID, packageVersionID, ref.ReferenceType, ref.ReferenceLocator, err)
-			}
+			batch.Add("sbom_package_external_refs", fmt.Sprintf(
+				`INSERT INTO sbom_package_external_refs(
+					sbom_id, package_version_id, reference_category, reference_type, reference_locator
+				) VALUES (%s, %s, %s, %s, %s)
+				ON CONFLICT DO NOTHING`,
+				sbomIDSubquery(repoID),
+				packageVersionExpr,
+				sqlString(ref.ReferenceCategory),
+				sqlString(ref.ReferenceType),
+				sqlString(ref.ReferenceLocator),
+			))
 		}
 	}
 
@@ -222,23 +145,91 @@ func (s *Store) IngestSBOMLinks(ctx context.Context, repoID int64, sbom *github.
 		if rel == nil {
 			continue
 		}
-		fromID, okFrom := packageVersionBySPDX[rel.SPDXElementID]
-		toID, okTo := packageVersionBySPDX[rel.RelatedSPDXElement]
+		fromIdentity, okFrom := packageIdentityBySPDX[rel.SPDXElementID]
+		toIdentity, okTo := packageIdentityBySPDX[rel.RelatedSPDXElement]
 		if !okFrom && !okTo {
 			continue
 		}
-		if _, err := relationshipStmt.ExecContext(
-			ctx,
-			sbomID,
-			nullableInt64(okFrom, fromID),
-			nullableInt64(okTo, toID),
-			rel.RelationshipType,
-		); err != nil {
-			return fmt.Errorf("sbom relationship insert failed (repo_id=%d sbom_id=%d from_spdx=%q to_spdx=%q from_package_version_id=%v to_package_version_id=%v): %w", repoID, sbomID, rel.SPDXElementID, rel.RelatedSPDXElement, nullableInt64(okFrom, fromID), nullableInt64(okTo, toID), err)
+		fromExpr := "NULL"
+		if okFrom {
+			fromExpr = packageVersionIDSubquery(fromIdentity.ecosystem, fromIdentity.name, fromIdentity.version, fromIdentity.purl)
 		}
+		toExpr := "NULL"
+		if okTo {
+			toExpr = packageVersionIDSubquery(toIdentity.ecosystem, toIdentity.name, toIdentity.version, toIdentity.purl)
+		}
+		batch.Add("sbom_relationships", fmt.Sprintf(
+			`INSERT INTO sbom_relationships(
+				sbom_id, from_package_version_id, to_package_version_id, relationship_type
+			) VALUES (%s, %s, %s, %s)
+			ON CONFLICT DO NOTHING`,
+			sbomIDSubquery(repoID),
+			fromExpr,
+			toExpr,
+			sqlString(rel.RelationshipType),
+		))
 	}
 
-	return tx.Commit()
+	return s.flushBatch(ctx, fmt.Sprintf("sbom links repo=%d", repoID), batch)
+}
+
+func buildSBOMDocumentUpsertSQL(repoID int64, doc *github.SBOMInfo) string {
+	return fmt.Sprintf(
+		`INSERT INTO sbom(
+			repo_id, spdx_id, spdx_version, document_name, data_license,
+			document_namespace, generated_at, creation_creators, document_describes_count, package_count, relationship_count
+		) VALUES (
+			%d, %s, %s, %s, %s, %s, %s, %s, %d, %d, %d
+		)
+		ON CONFLICT(repo_id) DO UPDATE SET
+			spdx_id = excluded.spdx_id,
+			spdx_version = excluded.spdx_version,
+			document_name = excluded.document_name,
+			data_license = excluded.data_license,
+			document_namespace = excluded.document_namespace,
+			generated_at = excluded.generated_at,
+			creation_creators = excluded.creation_creators,
+			document_describes_count = excluded.document_describes_count,
+			package_count = excluded.package_count,
+			relationship_count = excluded.relationship_count`,
+		repoID,
+		sqlString(doc.GetSPDXID()),
+		sqlString(doc.GetSPDXVersion()),
+		sqlString(doc.GetName()),
+		sqlString(doc.GetDataLicense()),
+		sqlString(doc.GetDocumentNamespace()),
+		sqlString(sbomCreatedAt(doc)),
+		sqlString(sbomCreators(doc)),
+		len(doc.DocumentDescribes),
+		len(doc.Packages),
+		len(doc.Relationships),
+	)
+}
+
+func buildPackageVersionUpsertSQL(identity sbomPackageIdentity) string {
+	return fmt.Sprintf(
+		`INSERT INTO package_versions(
+			package_id, version, purl, license, supplier, license_declared, download_location, files_analyzed
+		)
+		SELECT package_id, %s, %s, %s, %s, %s, %s, %s
+		FROM packages
+		WHERE ecosystem = %s AND name = %s
+		ON CONFLICT(package_id, version, purl) DO UPDATE SET
+			license = COALESCE(NULLIF(excluded.license, ''), package_versions.license),
+			supplier = COALESCE(NULLIF(excluded.supplier, ''), package_versions.supplier),
+			license_declared = COALESCE(NULLIF(excluded.license_declared, ''), package_versions.license_declared),
+			download_location = COALESCE(NULLIF(excluded.download_location, ''), package_versions.download_location),
+			files_analyzed = COALESCE(excluded.files_analyzed, package_versions.files_analyzed)`,
+		sqlString(identity.version),
+		sqlString(identity.purl),
+		sqlString(identity.licenseConcluded),
+		sqlString(""),
+		sqlString(identity.licenseDeclared),
+		sqlString(identity.downloadLocation),
+		sqlValue(identity.filesAnalyzed),
+		sqlString(defaultEcosystem(identity.ecosystem)),
+		sqlString(identity.name),
+	)
 }
 
 func upsertSBOMDocumentTx(ctx context.Context, tx *sql.Tx, repoID int64, doc *github.SBOMInfo) (int64, error) {
