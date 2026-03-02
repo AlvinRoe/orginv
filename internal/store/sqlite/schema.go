@@ -296,7 +296,7 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			PRIMARY KEY (repo_id, alert_number),
 			FOREIGN KEY(repo_id) REFERENCES repos(repo_id)
 		);`,
-		`CREATE TABLE IF NOT EXISTS vulnerable_repo_packages (
+		`CREATE TABLE IF NOT EXISTS vulnerable_package_versions (
 			repo_id INTEGER NOT NULL,
 			package_version_id INTEGER NOT NULL,
 			advisory_id INTEGER NOT NULL,
@@ -315,10 +315,10 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			FOREIGN KEY(advisory_id) REFERENCES advisories(advisory_id),
 			FOREIGN KEY(package_id) REFERENCES packages(package_id)
 		);`,
-		`CREATE INDEX IF NOT EXISTS idx_vulnerable_repo_packages_repo_id ON vulnerable_repo_packages(repo_id);`,
-		`CREATE INDEX IF NOT EXISTS idx_vulnerable_repo_packages_package_id ON vulnerable_repo_packages(package_id);`,
-		`CREATE INDEX IF NOT EXISTS idx_vulnerable_repo_packages_advisory_id ON vulnerable_repo_packages(advisory_id);`,
-		`CREATE INDEX IF NOT EXISTS idx_vulnerable_repo_packages_name ON vulnerable_repo_packages(ecosystem, package_name);`,
+		`CREATE INDEX IF NOT EXISTS idx_vulnerable_package_versions_repo_id ON vulnerable_package_versions(repo_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_vulnerable_package_versions_package_id ON vulnerable_package_versions(package_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_vulnerable_package_versions_advisory_id ON vulnerable_package_versions(advisory_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_vulnerable_package_versions_name ON vulnerable_package_versions(ecosystem, package_name);`,
 	}
 
 	_, err := s.db.ExecContext(ctx, strings.Join(schema, "\n"))
@@ -361,6 +361,7 @@ func applySchemaMigrations(ctx context.Context, db *sql.DB) error {
 		"repo_packages",
 		"repo_package_versions",
 		"vulnerable_repo_packages",
+		"vulnerable_package_versions",
 		"package_versions",
 		"packages",
 		"package_keys",

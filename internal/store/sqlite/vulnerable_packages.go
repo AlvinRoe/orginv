@@ -50,7 +50,7 @@ func (s *Store) RefreshVulnerableRepoPackages(ctx context.Context) error {
 	defer rows.Close()
 
 	batch := sqlbatch.New()
-	batch.Add("vulnerable_repo_packages", `DELETE FROM vulnerable_repo_packages`)
+	batch.Add("vulnerable_package_versions", `DELETE FROM vulnerable_package_versions`)
 
 	for rows.Next() {
 		var row vulnerableRepoPackageRow
@@ -73,7 +73,7 @@ func (s *Store) RefreshVulnerableRepoPackages(ctx context.Context) error {
 		if !vulnerableRangeMatches(row.packageVersion, row.vulnerableVersionRange) {
 			continue
 		}
-		batch.Add("vulnerable_repo_packages", buildVulnerableRepoPackageInsertSQL(row))
+		batch.Add("vulnerable_package_versions", buildVulnerableRepoPackageInsertSQL(row))
 	}
 	if err := rows.Err(); err != nil {
 		return err
@@ -84,7 +84,7 @@ func (s *Store) RefreshVulnerableRepoPackages(ctx context.Context) error {
 
 func buildVulnerableRepoPackageInsertSQL(row vulnerableRepoPackageRow) string {
 	return fmt.Sprintf(
-		`INSERT INTO vulnerable_repo_packages(
+		`INSERT INTO vulnerable_package_versions(
 			repo_id, package_version_id, advisory_id, package_id, ecosystem, package_name,
 			package_version, vulnerable_version_range, first_patched_version, advisory_severity, ghsa_id, cve_id
 		) VALUES (

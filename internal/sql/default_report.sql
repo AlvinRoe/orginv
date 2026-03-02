@@ -113,7 +113,7 @@ SELECT
 		FROM secret_alerts sa
 		WHERE sa.repo_id = r.repo_id
 	) AS secret_scanning_alert_details,
-	(SELECT COUNT(1) FROM vulnerable_repo_packages vrp WHERE vrp.repo_id = r.repo_id) AS vulnerable_package_count,
+	(SELECT COUNT(1) FROM vulnerable_package_versions vrp WHERE vrp.repo_id = r.repo_id) AS vulnerable_package_count,
 	(
 		SELECT COALESCE(group_concat(
 			'package_id=' || vrp.package_id ||
@@ -128,7 +128,7 @@ SELECT
 			';cve_id=' || COALESCE(vrp.cve_id, ''),
 			char(10)
 		), '')
-		FROM vulnerable_repo_packages vrp
+		FROM vulnerable_package_versions vrp
 		WHERE vrp.repo_id = r.repo_id
 	) AS vulnerable_package_details
 	FROM repos r
